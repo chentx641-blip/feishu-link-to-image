@@ -1,0 +1,23 @@
+# Render 部署配置（免费层）
+# 部署后请到 Render 控制台为该服务设置环境变量：
+#   FEISHU_APP_ID      你的飞书自建应用 App ID
+#   FEISHU_APP_SECRET  你的飞书自建应用 App Secret
+#   PUBLIC_BASE        本服务的公网地址，例如 https://feishu-link-to-image.onrender.com
+#   FLC_ACCESS_CODE    访问口令（留空则自动生成；建议显式设置）
+# PORT 由 Render 自动注入，无需设置。
+services:
+  - type: web
+    name: feishu-link-to-image
+    runtime: node
+    plan: free
+    buildCommand: "true"
+    startCommand: "node server.js"
+    envVars:
+      - key: FLC_ACCESS_CODE
+        generateValue: true
+      - key: FEISHU_APP_ID
+        sync: false
+      - key: FEISHU_APP_SECRET
+        sync: false
+      - key: PUBLIC_BASE
+        sync: false

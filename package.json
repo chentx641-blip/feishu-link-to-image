@@ -1,0 +1,13 @@
+{
+  "name": "feishu-link-to-image",
+  "version": "2.0.0",
+  "private": true,
+  "description": "飞书表格图片链接转单元格图片（运营版 / Open API + OAuth）",
+  "main": "server.js",
+  "scripts": {
+    "start": "node server.js"
+  },
+  "engines": {
+    "node": ">=18"
+  }
+}

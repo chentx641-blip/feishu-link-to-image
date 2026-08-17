@@ -1,0 +1,339 @@
+<!DOCTYPE html>
+<html lang="zh-CN">
+<head>
+<meta charset="UTF-8" />
+<meta name="viewport" content="width=device-width, initial-scale=1.0" />
+<title>飞书表格 · 图片链接转图片</title>
+<style>
+  :root {
+    --bg: #f5f7fa;
+    --card: #ffffff;
+    --line: #e3e8ef;
+    --text: #1f2733;
+    --muted: #6b7686;
+    --primary: #3370ff;
+    --primary-d: #245bdb;
+    --ok: #2ba471;
+    --err: #d54941;
+    --warn: #e37318;
+  }
+  * { box-sizing: border-box; }
+  body {
+    margin: 0; background: var(--bg); color: var(--text);
+    font-family: -apple-system, BlinkMacSystemFont, "Segoe UI", "PingFang SC", "Microsoft YaHei", sans-serif;
+    line-height: 1.6;
+  }
+  .wrap { max-width: 880px; margin: 0 auto; padding: 32px 20px 64px; }
+  header h1 { font-size: 22px; margin: 0 0 4px; }
+  header p { color: var(--muted); margin: 0 0 20px; font-size: 14px; }
+  .card {
+    background: var(--card); border: 1px solid var(--line); border-radius: 12px;
+    padding: 18px 20px; margin-bottom: 16px;
+  }
+  label { font-size: 13px; color: var(--muted); display: block; margin-bottom: 6px; }
+  .row { display: flex; gap: 10px; flex-wrap: wrap; }
+  input[type="text"] {
+    flex: 1; min-width: 240px; padding: 10px 12px; border: 1px solid var(--line);
+    border-radius: 8px; font-size: 14px; outline: none;
+  }
+  input[type="text"]:focus { border-color: var(--primary); }
+  button {
+    background: var(--primary); color: #fff; border: none; border-radius: 8px;
+    padding: 10px 18px; font-size: 14px; cursor: pointer; transition: .15s;
+  }
+  button:hover { background: var(--primary-d); }
+  button:disabled { background: #b9c4d6; cursor: not-allowed; }
+  button.ghost { background: #eef1f6; color: var(--text); }
+  button.ghost:hover { background: #e2e7ef; }
+  .msg { font-size: 13px; margin-top: 10px; }
+  .msg.err { color: var(--err); }
+  .msg.ok { color: var(--ok); }
+  .hidden { display: none !important; }
+  table { width: 100%; border-collapse: collapse; font-size: 13px; margin-top: 6px; }
+  th, td { text-align: left; padding: 8px 10px; border-bottom: 1px solid var(--line); }
+  th { color: var(--muted); font-weight: 600; }
+  td.range { font-family: ui-monospace, Menlo, Consolas, monospace; color: var(--primary-d); }
+  td .tag { font-size: 11px; padding: 1px 7px; border-radius: 999px; }
+  .tag.link { background: #e8f0ff; color: var(--primary-d); }
+  .tag.text { background: #fff3e8; color: var(--warn); }
+  .url-cell { max-width: 320px; overflow: hidden; text-overflow: ellipsis; white-space: nowrap; color: var(--muted); }
+  .progress { height: 10px; background: #eef1f6; border-radius: 999px; overflow: hidden; margin: 10px 0; }
+  .progress > div { height: 100%; width: 0; background: var(--primary); transition: width .25s; }
+  .stat { font-size: 13px; color: var(--muted); }
+  .stat b { color: var(--text); }
+  .res-ok { color: var(--ok); }
+  .res-fail { color: var(--err); }
+  .tip { font-size: 12px; color: var(--muted); background: #f0f4fb; border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
+  .count-badge { display: inline-block; background: var(--primary); color:#fff; border-radius: 999px; padding: 1px 10px; font-size: 12px; margin-left: 6px; }
+</style>
+</head>
+<body>
+<div class="wrap">
+  <header>
+    <h1>飞书表格 · 图片链接转图片</h1>
+    <p>粘贴飞书电子表格链接，自动扫描并把「图片链接」单元格替换为单元格内嵌图片。支持任意列位置，无需固定模板。</p>
+  </header>
+
+  <!-- 访问口令（部署到公网时由所有者提供） -->
+  <div class="card" id="gateCard">
+    <label>访问口令（由文档所有者提供）</label>
+    <div class="row">
+      <input type="text" id="accessCode" placeholder="请输入访问口令" autocomplete="off" />
+      <button id="gateBtn" class="ghost">记住口令</button>
+    </div>
+    <div class="msg" id="gateMsg"></div>
+  </div>
+
+  <!-- 管理员初始化（仅所有者）：用你的飞书账号完成一次 OAuth 授权 -->
+  <div class="card" id="adminCard">
+    <label>管理员初始化（仅文档所有者操作）</label>
+    <div class="row">
+      <button id="oauthStartBtn" class="ghost">用飞书账号初始化授权</button>
+      <span class="stat" id="oauthStatus">检测中…</span>
+    </div>
+    <div class="msg" id="oauthMsg"></div>
+    <div class="tip">本工具以「所有者的飞书身份」执行转换。首次部署需点此按钮，在飞书里授权一次（之后自动续期）。好友无需操作此步，只需把表共享给你的飞书账号即可。</div>
+  </div>
+
+  <!-- 步骤 1：解析 -->
+  <div class="card">
+    <label>飞书文档链接（电子表格 / wiki 链接均可）</label>
+    <div class="row">
+      <input type="text" id="url" placeholder="https://kgu4p60vfl.feishu.cn/wiki/..." />
+      <button id="resolveBtn">解析文档</button>
+    </div>
+    <div class="msg" id="resolveMsg"></div>
+  </div>
+
+  <!-- 步骤 2：选择子表 + 扫描 -->
+  <div class="card hidden" id="sheetCard">
+    <label>选择子表</label>
+    <div class="row">
+      <select id="sheetSelect" style="padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;min-width:200px;"></select>
+      <button id="scanBtn">扫描图片链接</button>
+    </div>
+    <div class="msg" id="scanMsg"></div>
+  </div>
+
+  <!-- 步骤 3：预览 + 确认转换 -->
+  <div class="card hidden" id="previewCard">
+    <div class="row" style="justify-content:space-between;align-items:center;">
+      <div><b id="scanCount">0</b> 个图片链接单元格待转换<span class="count-badge" id="sheetNameBadge"></span></div>
+      <label style="margin:0;"><input type="checkbox" id="selectAll" checked /> 全选</label>
+    </div>
+    <div style="max-height:320px;overflow:auto;margin-top:8px;">
+      <table>
+        <thead><tr><th style="width:36px;"></th><th>单元格</th><th>类型</th><th>图片链接</th></tr></thead>
+        <tbody id="cellTable"></tbody>
+      </table>
+    </div>
+    <div class="row" style="margin-top:14px;">
+      <button id="convertBtn">确认转换</button>
+      <button class="ghost" id="rescanBtn">重新扫描</button>
+    </div>
+    <div class="tip">⚠️ 转换会真实修改你的飞书表格（用图片替换对应链接单元格）。已内嵌图片 / 纯文本 / 空单元格不会被改动。建议先确认预览列表无误再转换。</div>
+  </div>
+
+  <!-- 步骤 4：进度 -->
+  <div class="card hidden" id="jobCard">
+    <label>转换进度</label>
+    <div class="progress"><div id="bar"></div></div>
+    <div class="stat" id="jobStat">准备中…</div>
+    <div id="jobResults" style="margin-top:10px;"></div>
+  </div>
+</div>
+
+<script>
+const $ = (id) => document.getElementById(id);
+let RESOLVED = null;     // { title, sheets:[...] }
+let SCAN = null;         // { total, cells:[...] }
+let JOB_TIMER = null;
+
+function show(el){ el.classList.remove('hidden'); }
+function hide(el){ el.classList.add('hidden'); }
+
+// 访问口令：本地存储 + 每个请求自动带上
+const CODE_KEY = 'flc_access_code';
+$('accessCode').value = localStorage.getItem(CODE_KEY) || '';
+$('accessCode').addEventListener('input', (e) => {
+  localStorage.setItem(CODE_KEY, e.target.value.trim());
+});
+$('gateBtn').onclick = () => {
+  localStorage.setItem(CODE_KEY, $('accessCode').value.trim());
+  $('gateMsg').className = 'msg ok';
+  $('gateMsg').textContent = '已记住口令，可直接使用。';
+};
+// 若服务端未启用口令，自动隐藏该卡片；并刷新 OAuth 状态
+(async () => {
+  try {
+    const r = await fetch('/api/info');
+    const d = await r.json();
+    if (!d.gateEnabled) hide($('gateCard'));
+  } catch (e) { /* 本地模式忽略 */ }
+  refreshOauthStatus();
+})();
+async function apiFetch(p, opts = {}) {
+  opts.headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});
+  const code = localStorage.getItem(CODE_KEY) || '';
+  if (code) opts.headers['x-access-code'] = code;
+  return fetch(p, opts);
+}
+
+// 管理员 OAuth 初始化：检测状态 + 触发授权
+async function refreshOauthStatus() {
+  try {
+    const r = await apiFetch('/api/oauth/status');
+    const d = await r.json();
+    if (d.tokenReady) {
+      $('oauthStatus').textContent = '✓ 授权已就绪';
+      $('oauthStatus').style.color = 'var(--ok)';
+    } else {
+      $('oauthStatus').textContent = '⚠ 尚未授权（所有者需点右侧按钮）';
+      $('oauthStatus').style.color = 'var(--warn)';
+    }
+  } catch (e) {
+    $('oauthStatus').textContent = '状态未知';
+  }
+}
+$('oauthStartBtn').onclick = async () => {
+  const msg = $('oauthMsg');
+  msg.className = 'msg'; msg.textContent = '正在生成授权链接…';
+  try {
+    const r = await apiFetch('/api/oauth/start');
+    const d = await r.json();
+    if (!d.ok) { msg.className='msg err'; msg.textContent = d.error || '生成失败'; return; }
+    msg.className='msg ok'; msg.textContent = '已打开飞书授权页，请在飞书内完成授权（约 1 分钟自动检测）…';
+    window.open(d.authUrl, '_blank');
+    // 轮询状态
+    let tries = 0;
+    const timer = setInterval(async () => {
+      tries++;
+      try {
+        const rr = await apiFetch('/api/oauth/status');
+        const dd = await rr.json();
+        if (dd.tokenReady) {
+          clearInterval(timer);
+          $('oauthStatus').textContent = '✓ 授权已就绪';
+          $('oauthStatus').style.color = 'var(--ok)';
+          msg.textContent = '授权成功，工具已可用。';
+        }
+      } catch (e) {}
+      if (tries > 40) { clearInterval(timer); msg.textContent = '授权检测超时，请确认已在飞书完成授权后刷新页面。'; }
+    }, 2000);
+  } catch (e) {
+    msg.className='msg err'; msg.textContent = '请求失败：' + e.message;
+  }
+};
+
+
+$('resolveBtn').onclick = async () => {
+  const url = $('url').value.trim();
+  const msg = $('resolveMsg');
+  msg.className = 'msg'; msg.textContent = '解析中…';
+  if (!url) { msg.className='msg err'; msg.textContent='请输入飞书文档链接'; return; }
+  try {
+    const r = await apiFetch('/api/resolve', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url})});
+    const d = await r.json();
+    if (!d.ok) { msg.className='msg err'; msg.textContent = d.error || '解析失败'; return; }
+    RESOLVED = d;
+    const sel = $('sheetSelect'); sel.innerHTML = '';
+    d.sheets.forEach((s, i) => {
+      const o = document.createElement('option');
+      o.value = s.sheet_id;
+      o.textContent = `${s.sheet_name}（${s.row_count}行 × ${s.column_count}列）`;
+      sel.appendChild(o);
+    });
+    msg.className='msg ok';
+    msg.textContent = `解析成功：${d.sheets.length} 个子表` + (d.title ? ` · ${d.title}` : '');
+    show($('sheetCard'));
+    hide($('previewCard')); hide($('jobCard'));
+  } catch(e) {
+    msg.className='msg err'; msg.textContent = '请求失败：' + e.message;
+  }
+};
+
+$('scanBtn').onclick = async () => {
+  const url = $('url').value.trim();
+  const sheetId = $('sheetSelect').value;
+  const sheet = RESOLVED.sheets.find(s => s.sheet_id === sheetId);
+  const msg = $('scanMsg');
+  msg.className='msg'; msg.textContent='扫描中（逐块读取整张表）…';
+  try {
+    const r = await apiFetch('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({spreadsheetToken: RESOLVED.spreadsheetToken, sheetId, sheetName: sheet.sheet_name, rowCount:sheet.row_count, columnCount:sheet.column_count})});
+    const d = await r.json();
+    if (!d.ok) { msg.className='msg err'; msg.textContent = d.error || '扫描失败'; return; }
+    SCAN = d;
+    renderPreview(d);
+    msg.className='msg ok'; msg.textContent = `扫描完成，共发现 ${d.total} 个图片链接单元格。`;
+    show($('previewCard')); hide($('jobCard'));
+  } catch(e) {
+    msg.className='msg err'; msg.textContent = '请求失败：' + e.message;
+  }
+};
+
+function renderPreview(d) {
+  $('scanCount').textContent = d.total;
+  $('sheetNameBadge').textContent = $('sheetSelect').value;
+  const tb = $('cellTable'); tb.innerHTML = '';
+  d.cells.forEach((c, i) => {
+    const tr = document.createElement('tr');
+    tr.innerHTML = `
+      <td><input type="checkbox" class="cellchk" data-i="${i}" checked /></td>
+      <td class="range">${c.range}</td>
+      <td><span class="tag ${c.source}">图片链接</span></td>
+      <td class="url-cell" title="${c.url}">${c.url}</td>`;
+    tb.appendChild(tr);
+  });
+  $('selectAll').checked = true;
+}
+
+$('selectAll').onchange = (e) => {
+  document.querySelectorAll('.cellchk').forEach(ch => ch.checked = e.target.checked);
+};
+
+$('rescanBtn').onclick = () => { hide($('previewCard')); $('scanMsg').textContent=''; };
+
+$('convertBtn').onclick = async () => {
+  const sheetId = $('sheetSelect').value;
+  const sheet = RESOLVED.sheets.find(s => s.sheet_id === sheetId);
+  const chosen = SCAN.cells.filter((_, i) => document.querySelector(`.cellchk[data-i="${i}"]`).checked);
+  if (chosen.length === 0) { alert('请至少选择一个单元格'); return; }
+  try {
+    const r = await apiFetch('/api/convert', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({spreadsheetToken: RESOLVED.spreadsheetToken, sheetId, sheetName: sheet.sheet_name,
+        cells: chosen.map(c=>({range:c.range, url:c.url, source:c.source}))})});
+    const d = await r.json();
+    if (!d.ok) { alert(d.error || '转换启动失败'); return; }
+    startPolling(d.jobId);
+  } catch(e) { alert('请求失败：' + e.message); }
+};
+
+function startPolling(jobId) {
+  show($('jobCard'));
+  hide($('previewCard'));
+  const bar = $('bar'); const stat = $('jobStat'); const box = $('jobResults');
+  bar.style.width = '0%'; stat.textContent = '开始转换…'; box.innerHTML = '';
+  if (JOB_TIMER) clearInterval(JOB_TIMER);
+  JOB_TIMER = setInterval(async () => {
+    try {
+      const r = await apiFetch('/api/job/' + jobId);
+      const d = await r.json();
+      if (!d.ok) { stat.textContent = '查询失败'; clearInterval(JOB_TIMER); return; }
+      const pct = d.total ? Math.round(d.done / d.total * 100) : 0;
+      bar.style.width = pct + '%';
+      stat.innerHTML = `已完成 <b>${d.done}</b> / ${d.total} &nbsp;·&nbsp; 状态：${d.status}`;
+      if (d.status === 'finished' || d.status === 'error') {
+        clearInterval(JOB_TIMER);
+        const okCnt = d.results.filter(x=>x.status==='done').length;
+        const failCnt = d.results.filter(x=>x.status==='failed').length;
+        box.innerHTML = `<div class="stat" style="margin-bottom:6px;">成功 <b class="res-ok">${okCnt}</b> · 失败 <b class="res-fail">${failCnt}</b></div>` +
+          d.results.map(x => `<div class="stat">${x.range} — <span class="${x.status==='done'?'res-ok':'res-fail'}">${x.status==='done'?'✓ 已转图片':('✗ '+ (x.error||'失败'))}</span></div>`).join('');
+        stat.innerHTML += d.status==='finished' ? ' · <b class="res-ok">全部完成</b>' : ' · <b class="res-fail">存在失败</b>';
+      }
+    } catch(e) { /* ignore transient */ }
+  }, 800);
+}
+</script>
+</body>
+</html>
