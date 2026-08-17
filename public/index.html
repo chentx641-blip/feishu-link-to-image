@@ -79,9 +79,10 @@
     <label>访问口令（由文档所有者提供）</label>
     <div class="row">
       <input type="text" id="accessCode" placeholder="请输入访问口令" autocomplete="off" />
-      <button id="gateBtn" class="ghost">记住口令</button>
+      <button id="gateBtn" class="ghost">验证口令</button>
     </div>
     <div class="msg" id="gateMsg"></div>
+    <div id="modeLine" class="stat hidden" style="margin-top:8px;"></div>
   </div>
 
   <!-- 管理员初始化（仅文档所有者操作）——令牌就绪后自动折叠 -->
@@ -92,18 +93,18 @@
       <button class="ghost" id="adminExpand" style="font-size:12px;padding:4px 10px;">展开</button>
     </div>
     <div id="adminNeedAuth">
-      <label>⚠️ 管理员初始化（仅应用创建者操作，好友请跳过）</label>
+      <label>⚠️ 管理员初始化（仅应用创建者可用，好友看不到/点不了）</label>
       <div class="row">
-        <button id="oauthStartBtn" class="ghost">用飞书账号初始化授权</button>
-        <span class="stat" id="oauthStatus">检测中…</span>
+        <button id="oauthStartBtn" class="ghost" disabled style="opacity:.5;cursor:not-allowed;">用飞书账号初始化授权</button>
+        <span class="stat" id="oauthStatus">等待验证口令…</span>
       </div>
       <div class="msg" id="oauthMsg"></div>
       <div class="tip">本工具以「应用创建者的飞书身份」执行转换。如果你不是应用创建者，<b>请不要点上方按钮</b>（会因无权限报错）。你只需把要处理的表格共享给创建者即可正常使用。</div>
     </div>
   </div>
 
-  <!-- 步骤 1：解析 -->
-  <div class="card">
+  <!-- 步骤 1：解析（验证口令后展开） -->
+  <div class="card hidden" id="resolveCard">
     <label>飞书文档链接（电子表格 / wiki 链接均可）</label>
     <div class="row">
       <input type="text" id="url" placeholder="https://kgu4p60vfl.feishu.cn/wiki/..." />
@@ -165,19 +166,68 @@ $('accessCode').value = localStorage.getItem(CODE_KEY) || '';
 $('accessCode').addEventListener('input', (e) => {
   localStorage.setItem(CODE_KEY, e.target.value.trim());
 });
-$('gateBtn').onclick = () => {
-  localStorage.setItem(CODE_KEY, $('accessCode').value.trim());
-  $('gateMsg').className = 'msg ok';
-  $('gateMsg').textContent = '已记住口令，可直接使用。';
+$('gateBtn').onclick = async () => {
+  const code = $('accessCode').value.trim();
+  if (!code) { $('gateMsg').className='msg err'; $('gateMsg').textContent='请输入访问口令'; return; }
+  localStorage.setItem(CODE_KEY, code);
+  $('gateMsg').className = 'msg'; $('gateMsg').textContent = '正在校验口令…';
+  try {
+    // 1) 校验口令（/api/oauth/status 带口令闸，401=错误）
+    const r = await apiFetch('/api/oauth/status');
+    if (r.status === 401) {
+      $('gateMsg').className='msg err'; $('gateMsg').textContent='访问口令错误，请向文档所有者索取。';
+      return;
+    }
+    const d = await r.json();
+    $('gateMsg').className='msg ok'; $('gateMsg').textContent='✓ 口令正确，已展开功能。';
+    // 2) 展开「粘贴链接」输入框
+    show($('resolveCard'));
+    // 3) 判断是否为管理员（决定是否点亮初始化按钮）
+    let isAdmin = false;
+    try {
+      const ar = await apiFetch('/api/oauth/admin-check');
+      const ad = await ar.json();
+      isAdmin = !!(ad && ad.isAdmin);
+    } catch (e) {}
+    applyAdminMode(isAdmin);
+    refreshOauthStatus();
+  } catch (e) {
+    $('gateMsg').className='msg err'; $('gateMsg').textContent='校验失败：' + e.message;
+  }
 };
+
+// 管理员模式：点亮/置灰初始化按钮，并显示身份标识
+function applyAdminMode(isAdmin) {
+  const btn = $('oauthStartBtn');
+  const mode = $('modeLine');
+  show(mode);
+  if (isAdmin) {
+    btn.disabled = false;
+    btn.style.opacity = '1';
+    btn.style.cursor = 'pointer';
+    mode.className = 'stat';
+    mode.style.color = 'var(--primary)';
+    mode.textContent = '👑 管理员模式：你可使用全部功能并初始化授权。';
+  } else {
+    btn.disabled = true;
+    btn.style.opacity = '.5';
+    btn.style.cursor = 'not-allowed';
+    mode.className = 'stat';
+    mode.style.color = 'var(--muted)';
+    mode.textContent = '👤 普通用户模式：可直接使用转换功能，无需（也不能）授权。';
+  }
+}
+
 // 若服务端未启用口令，自动隐藏该卡片；并刷新 OAuth 状态
 (async () => {
   try {
     const r = await fetch('/api/info');
     const d = await r.json();
-    if (!d.gateEnabled) hide($('gateCard'));
+    if (!d.gateEnabled) {
+      hide($('gateCard'));
+      show($('resolveCard'));   // 无口令时直接可用
+    }
   } catch (e) { /* 本地模式忽略 */ }
-  refreshOauthStatus();
 })();
 async function apiFetch(p, opts = {}) {
   opts.headers = Object.assign({ 'Content-Type': 'application/json' }, opts.headers || {});

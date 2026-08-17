@@ -3,7 +3,8 @@
 #   FEISHU_APP_ID      你的飞书自建应用 App ID
 #   FEISHU_APP_SECRET  你的飞书自建应用 App Secret
 #   PUBLIC_BASE        本服务的公网地址，例如 https://feishu-link-to-image.onrender.com
-#   FLC_ACCESS_CODE    访问口令（留空则自动生成；建议显式设置）
+#   FLC_ACCESS_CODE    普通访问口令（好友使用；留空则自动生成，建议显式设置）
+#   FLC_ADMIN_CODE     管理员密钥（可选；持有者可点亮初始化按钮。不设置则等于 FLC_ACCESS_CODE）
 # PORT 由 Render 自动注入，无需设置。
 services:
   - type: web

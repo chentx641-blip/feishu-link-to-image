@@ -10,9 +10,10 @@
  *
  * 接口：
  *   GET  /api/info            -> 网关/令牌状态
- *   GET  /api/oauth/start     -> 返回飞书授权页 URL（需访问口令，仅所有者）
+ *   GET  /api/oauth/start     -> 返回飞书授权页 URL（仅管理员密钥可唤起）
  *   GET  /api/oauth/callback  -> 飞书回调，换取并保存 user_access_token
  *   GET  /api/oauth/status    -> 令牌是否已就绪
+ *   GET  /api/oauth/admin-check -> 当前口令是否为管理员密钥
  *   POST /api/resolve         -> 解析文档 -> {spreadsheetToken, sheets[]}
  *   POST /api/scan            -> 扫描某子表所有「图片链接」单元格
  *   POST /api/convert         -> 逐格下载图片并写入单元格（异步任务）
@@ -48,6 +49,12 @@ if (!ACCESS_CODE) {
 } else {
   console.log('[boot] 已启用访问口令（来自环境变量 FLC_ACCESS_CODE）');
 }
+
+// 管理员专属密钥（可选）：持有者可点亮「初始化授权」按钮并完成飞书 OAuth。
+// 未设置时默认等于 ACCESS_CODE（即同一口令既可用又可管理，兼容旧部署）。
+// 设置后：好友拿 FLC_ACCESS_CODE 只能使用工具、看不到/点不了初始化按钮；
+//         你拿 FLC_ADMIN_CODE 既能使用、也能唤起初始化按钮。
+const ADMIN_CODE = process.env.FLC_ADMIN_CODE || ACCESS_CODE;
 
 // ---------------------------------------------------------------------------
 // 令牌存储（运营者 user_access_token）
@@ -346,8 +353,17 @@ function getAccessCode(req, body) {
 }
 function gateOK(req, res, body) {
   if (!ACCESS_CODE) return true;
-  if (getAccessCode(req, body) === ACCESS_CODE) return true;
+  const c = getAccessCode(req, body);
+  if (c === ACCESS_CODE || c === ADMIN_CODE) return true;
   sendJSON(res, 401, { ok: false, error: '访问口令错误，请向文档所有者索取后再试。' });
+  return false;
+}
+
+// 仅管理员密钥可过（用于初始化授权等危险操作）
+function adminGateOK(req, res, body) {
+  if (!ADMIN_CODE) return true;
+  if (getAccessCode(req, body) === ADMIN_CODE) return true;
+  sendJSON(res, 403, { ok: false, error: '仅管理员可操作：请使用管理员密钥（FLC_ADMIN_CODE）。' });
   return false;
 }
 
@@ -371,9 +387,9 @@ const server = http.createServer(async (req, res) => {
       });
     }
 
-    // OAuth：开始授权（需访问口令，仅所有者）
+    // OAuth：开始授权（仅管理员密钥可唤起）
     if (req.method === 'GET' && urlp === '/api/oauth/start') {
-      if (!gateOK(req, res, null)) return;
+      if (!adminGateOK(req, res, null)) return;
       if (!FEISHU_APP_ID || !FEISHU_APP_SECRET) {
         return sendJSON(res, 200, { ok: false, error: '未配置飞书应用凭证（FEISHU_APP_ID / FEISHU_APP_SECRET）。' });
       }
@@ -437,6 +453,16 @@ const server = http.createServer(async (req, res) => {
         ok: true,
         tokenReady: !!(tokenStore && tokenStore.access_token),
         expiresAt: tokenStore ? tokenStore.expires_at : null,
+      });
+    }
+
+    // 管理员身份校验（用于前端决定是否点亮初始化按钮）
+    if (req.method === 'GET' && urlp === '/api/oauth/admin-check') {
+      if (!gateOK(req, res, null)) return;
+      const c = getAccessCode(req, null);
+      return sendJSON(res, 200, {
+        ok: true,
+        isAdmin: !!(ADMIN_CODE && c === ADMIN_CODE),
       });
     }
 
