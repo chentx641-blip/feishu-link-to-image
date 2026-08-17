@@ -58,30 +58,180 @@ const ADMIN_CODE = process.env.FLC_ADMIN_CODE || ACCESS_CODE;
 
 // ---------------------------------------------------------------------------
 // 令牌存储（运营者 user_access_token）
+// 持久化策略：本地 tokens.json（L1 缓存） + 飞书云空间应用文件夹（L2，跨休眠/重启）
+//   - 用 tenant_access_token（由 App ID/Secret 直接换取，无需用户令牌）读写云空间，
+//     因此实例被 Render 休眠唤醒、本地磁盘清空后，仍能自动从云空间拉回 refresh_token
+//     并静默刷新，好友无需你重新授权。
 // ---------------------------------------------------------------------------
 let tokenStore = null; // { access_token, refresh_token, expires_at }
-function loadToken() {
-  if (tokenStore) return;
+let bootstrapping = false;
+const DRIVE_FILE_NAME = 'flc-tokens.json';
+let tenantTokenCache = { token: '', expire: 0 };
+
+async function getTenantToken() {
+  const now = Date.now();
+  if (tenantTokenCache.token && now < tenantTokenCache.expire - 60 * 1000) return tenantTokenCache.token;
+  const r = await feishuCall('POST', '/open-apis/auth/v3/tenant_access_token/internal', {
+    body: { app_id: FEISHU_APP_ID, app_secret: FEISHU_APP_SECRET },
+  });
+  if (r.code !== 0 || !r.tenant_access_token) {
+    throw new Error('获取 tenant_access_token 失败: ' + (r.msg || JSON.stringify(r).slice(0, 200)));
+  }
+  tenantTokenCache = { token: r.tenant_access_token, expire: now + (r.expire || 7200) * 1000 };
+  return r.tenant_access_token;
+}
+
+async function getAppFolderToken() {
+  const tt = await getTenantToken();
+  const meta = await feishuCall('GET', '/open-apis/drive/explorer/v2/root_folder/meta', { token: tt });
+  if (meta.code !== 0 || !meta.data || !meta.data.token) {
+    throw new Error('获取应用云空间根目录失败: ' + (meta.msg || JSON.stringify(meta).slice(0, 200)));
+  }
+  return meta.data.token;
+}
+
+async function findDriveTokenFile(tt, folderToken) {
+  const list = await feishuCall('GET', '/open-apis/drive/explorer/v2/files', {
+    params: { folder_token: folderToken, page_size: 100 }, token: tt,
+  });
+  const files = (list.data && list.data.files) || [];
+  return files.find((f) => f.name === DRIVE_FILE_NAME && f.type === 'file') || null;
+}
+
+async function readDriveToken() {
+  const tt = await getTenantToken();
+  const folderToken = await getAppFolderToken();
+  const f = await findDriveTokenFile(tt, folderToken);
+  if (!f) return null;
+  const dl = await feishuCall('GET', '/open-apis/drive/explorer/v2/files/' + f.token + '/download', { token: tt });
+  let url = null;
+  if (dl.code === 0 && dl.data) url = dl.data.url || dl.data.file_url;
+  if (!url) throw new Error('无法获取云空间文件下载地址: ' + JSON.stringify(dl).slice(0, 200));
+  const resp = await fetch(url);
+  if (!resp.ok) throw new Error('下载云空间文件失败 HTTP ' + resp.status);
+  return JSON.parse(await resp.text());
+}
+
+async function getAppBotOpenId(tt) {
   try {
-    if (fs.existsSync(TOKEN_FILE)) {
-      tokenStore = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8'));
-      return;
+    const bi = await feishuCall('GET', '/open-apis/bot/v3/info', { token: tt });
+    if (bi.code === 0 && bi.bot && bi.bot.open_id) return bi.bot.open_id;
+  } catch (e) { /* ignore */ }
+  return null;
+}
+
+async function writeDriveToken(t) {
+  const tt = await getTenantToken();
+  const folderToken = await getAppFolderToken();
+  const old = await findDriveTokenFile(tt, folderToken);
+  if (old) {
+    await feishuCall('DELETE', '/open-apis/drive/explorer/v2/files/' + old.token, { token: tt });
+  }
+  const uploaderId = await getAppBotOpenId(tt);
+  const content = JSON.stringify(t, null, 2);
+  const buf = Buffer.from(content, 'utf8');
+  const boundary = '----flcBoundary' + Date.now();
+  const parts = [];
+  const field = (name, val) => {
+    parts.push(Buffer.from('--' + boundary + '\r\n'));
+    parts.push(Buffer.from('Content-Disposition: form-data; name="' + name + '"\r\n\r\n'));
+    parts.push(Buffer.from(String(val) + '\r\n'));
+  };
+  field('file_name', DRIVE_FILE_NAME);
+  field('parent_type', 'folder');
+  field('parent_node', folderToken);
+  field('size', String(buf.length));
+  if (uploaderId) field('uploader_id', uploaderId);
+  parts.push(Buffer.from('--' + boundary + '\r\n'));
+  parts.push(Buffer.from('Content-Disposition: form-data; name="file"; filename="' + DRIVE_FILE_NAME + '"\r\n'));
+  parts.push(Buffer.from('Content-Type: application/json\r\n\r\n'));
+  parts.push(buf);
+  parts.push(Buffer.from('\r\n'));
+  parts.push(Buffer.from('--' + boundary + '--\r\n'));
+  const resp = await fetch('https://open.feishu.cn/open-apis/drive/v1/files/upload_all', {
+    method: 'POST',
+    headers: {
+      Authorization: 'Bearer ' + tt,
+      'Content-Type': 'multipart/form-data; boundary=' + boundary,
+    },
+    body: Buffer.concat(parts),
+  });
+  const r = await resp.json();
+  if (r.code !== 0) throw new Error('写入云空间失败: ' + (r.msg || JSON.stringify(r).slice(0, 200)));
+}
+
+// 静默刷新（用 refresh_token 换新令牌并持久化）
+async function refreshTokenNow() {
+  if (!tokenStore || !tokenStore.refresh_token) return false;
+  try {
+    const r = await feishuCall('POST', '/open-apis/authen/v2/oauth/token', {
+      body: {
+        grant_type: 'refresh_token',
+        client_id: FEISHU_APP_ID,
+        client_secret: FEISHU_APP_SECRET,
+        refresh_token: tokenStore.refresh_token,
+      },
+    });
+    if (r.code === 0 && r.access_token) {
+      tokenStore = {
+        access_token: r.access_token,
+        refresh_token: r.refresh_token || tokenStore.refresh_token,
+        expires_at: Date.now() + (r.expires_in || 7200) * 1000,
+      };
+      await persistToken(tokenStore);
+      return true;
     }
   } catch (e) { /* ignore */ }
-  // 允许用环境变量兜底（适合 PaaS 持久化）
-  if (process.env.FLC_OP_ACCESS_TOKEN) {
-    tokenStore = {
-      access_token: process.env.FLC_OP_ACCESS_TOKEN,
-      refresh_token: process.env.FLC_OP_REFRESH_TOKEN || '',
-      expires_at: Date.now() + 3600 * 1000,
-    };
-  }
+  return false;
 }
-function saveToken(t) {
+
+// 持久化：本地 + 云空间（云空间失败不影响本次使用）
+async function persistToken(t) {
   tokenStore = t;
   try { fs.writeFileSync(TOKEN_FILE, JSON.stringify(t, null, 2)); } catch (e) { /* ignore */ }
+  if (FEISHU_APP_ID && FEISHU_APP_SECRET) {
+    try { await writeDriveToken(t); }
+    catch (e) { console.log('[token] 写入云空间失败（本地已保存，不影响本次使用）: ' + e.message); }
+  }
 }
-loadToken();
+
+// 启动恢复：本地 -> 云空间（tenant token 读取，无需用户令牌）-> 环境变量兜底
+async function bootstrapToken() {
+  if (tokenStore) return tokenStore;
+  if (bootstrapping) return null;
+  bootstrapping = true;
+  try {
+    if (fs.existsSync(TOKEN_FILE)) {
+      try { tokenStore = JSON.parse(fs.readFileSync(TOKEN_FILE, 'utf8')); return tokenStore; } catch (e) { /* ignore */ }
+    }
+    if (FEISHU_APP_ID && FEISHU_APP_SECRET) {
+      try {
+        const t = await readDriveToken();
+        if (t && t.access_token) {
+          tokenStore = t;
+          if (Date.now() >= (tokenStore.expires_at || 0) - 5 * 60 * 1000 && tokenStore.refresh_token) {
+            await refreshTokenNow();
+          }
+          return tokenStore;
+        }
+      } catch (e) {
+        console.log('[token] 从云空间恢复失败（可忽略，等待管理员重新授权）: ' + e.message);
+      }
+    }
+    if (process.env.FLC_OP_ACCESS_TOKEN) {
+      tokenStore = {
+        access_token: process.env.FLC_OP_ACCESS_TOKEN,
+        refresh_token: process.env.FLC_OP_REFRESH_TOKEN || '',
+        expires_at: Date.now() + 3600 * 1000,
+      };
+    }
+  } finally {
+    bootstrapping = false;
+  }
+  return tokenStore;
+}
+
+async function saveToken(t) { await persistToken(t); }
 
 let oauthState = ''; // 防止 CSRF
 
@@ -151,32 +301,16 @@ async function feishuCall(method, apiPath, { params = null, body = null, token =
 }
 
 async function getValidToken() {
-  loadToken();
+  await bootstrapToken();
   if (!tokenStore || !tokenStore.access_token) {
     const err = new Error('运营者令牌未初始化：请先用访问口令访问 /api/oauth/start 完成飞书授权。');
     err.code = 'NO_TOKEN';
     throw err;
   }
-  // 提前 5 分钟刷新
+  // 提前 5 分钟刷新（内部已自动持久化到本地 + 云空间）
   if (Date.now() >= (tokenStore.expires_at || 0) - 5 * 60 * 1000) {
     if (tokenStore.refresh_token) {
-      try {
-        const r = await feishuCall('POST', '/open-apis/authen/v2/oauth/token', {
-          body: {
-            grant_type: 'refresh_token',
-            client_id: FEISHU_APP_ID,
-            client_secret: FEISHU_APP_SECRET,
-            refresh_token: tokenStore.refresh_token,
-          },
-        });
-        if (r.code === 0 && r.access_token) {
-          saveToken({
-            access_token: r.access_token,
-            refresh_token: r.refresh_token || tokenStore.refresh_token,
-            expires_at: Date.now() + (r.expires_in || 7200) * 1000,
-          });
-        }
-      } catch (e) { /* 刷新失败则继续使用旧令牌 */ }
+      await refreshTokenNow();
     }
   }
   return tokenStore.access_token;
@@ -377,7 +511,7 @@ const server = http.createServer(async (req, res) => {
     }
 
     if (req.method === 'GET' && urlp === '/api/info') {
-      loadToken();
+      await bootstrapToken();
       return sendJSON(res, 200, {
         ok: true,
         gateEnabled: !!ACCESS_CODE,
@@ -438,7 +572,7 @@ const server = http.createServer(async (req, res) => {
       if (r.code !== 0 || !r.access_token) {
         return sendJSON(res, 200, { ok: false, error: '换取令牌失败：' + (r.msg || JSON.stringify(r).slice(0, 200)) });
       }
-      saveToken({
+      await saveToken({
         access_token: r.access_token,
         refresh_token: r.refresh_token || '',
         expires_at: Date.now() + (r.expires_in || 7200) * 1000,
@@ -448,7 +582,7 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && urlp === '/api/oauth/status') {
       if (!gateOK(req, res, null)) return;
-      loadToken();
+      await bootstrapToken();
       return sendJSON(res, 200, {
         ok: true,
         tokenReady: !!(tokenStore && tokenStore.access_token),
@@ -531,4 +665,8 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, () => {
   console.log('[server] 飞书图片链接转换服务（运营版）已启动: http://localhost:' + PORT);
   console.log('[server] 飞书应用凭证: ' + (FEISHU_APP_ID ? '已配置' : '未配置（OAuth 初始化前需配置）'));
+  // 启动恢复令牌（本地/云空间），失败仅记录，等待管理员重新授权
+  bootstrapToken()
+    .then((t) => console.log('[boot] 令牌恢复: ' + (t && t.access_token ? '成功（含云空间持久化）' : '无（等待管理员初始化授权）')))
+    .catch((e) => console.log('[boot] 令牌恢复失败（可忽略）: ' + e.message));
 });
