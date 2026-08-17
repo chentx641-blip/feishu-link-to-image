@@ -84,15 +84,22 @@
     <div class="msg" id="gateMsg"></div>
   </div>
 
-  <!-- 管理员初始化（仅所有者）：用你的飞书账号完成一次 OAuth 授权 -->
+  <!-- 管理员初始化（仅文档所有者操作）——令牌就绪后自动折叠 -->
   <div class="card" id="adminCard">
-    <label>管理员初始化（仅文档所有者操作）</label>
-    <div class="row">
-      <button id="oauthStartBtn" class="ghost">用飞书账号初始化授权</button>
-      <span class="stat" id="oauthStatus">检测中…</span>
+    <div id="adminReady" class="hidden" style="display:flex;align-items:center;gap:8px;">
+      <span style="font-size:18px;">✅</span>
+      <span class="stat" style="color:var(--ok);">系统已授权，可直接使用下方功能。</span>
+      <button class="ghost" id="adminExpand" style="font-size:12px;padding:4px 10px;">展开</button>
     </div>
-    <div class="msg" id="oauthMsg"></div>
-    <div class="tip">本工具以「所有者的飞书身份」执行转换。首次部署需点此按钮，在飞书里授权一次（之后自动续期）。好友无需操作此步，只需把表共享给你的飞书账号即可。</div>
+    <div id="adminNeedAuth">
+      <label>⚠️ 管理员初始化（仅应用创建者操作，好友请跳过）</label>
+      <div class="row">
+        <button id="oauthStartBtn" class="ghost">用飞书账号初始化授权</button>
+        <span class="stat" id="oauthStatus">检测中…</span>
+      </div>
+      <div class="msg" id="oauthMsg"></div>
+      <div class="tip">本工具以「应用创建者的飞书身份」执行转换。如果你不是应用创建者，<b>请不要点上方按钮</b>（会因无权限报错）。你只需把要处理的表格共享给创建者即可正常使用。</div>
+    </div>
   </div>
 
   <!-- 步骤 1：解析 -->
@@ -184,17 +191,27 @@ async function refreshOauthStatus() {
   try {
     const r = await apiFetch('/api/oauth/status');
     const d = await r.json();
+    const ready = $('adminReady');
+    const need = $('adminNeedAuth');
     if (d.tokenReady) {
+      // 令牌就绪：折叠管理区，只显示绿色状态条
+      show(ready); hide(need);
       $('oauthStatus').textContent = '✓ 授权已就绪';
       $('oauthStatus').style.color = 'var(--ok)';
     } else {
-      $('oauthStatus').textContent = '⚠ 尚未授权（所有者需点右侧按钮）';
+      // 未授权：展开管理区，显示按钮
+      hide(ready); show(need);
+      $('oauthStatus').textContent = '⚠ 尚未授权（应用创建者需点右侧按钮）';
       $('oauthStatus').style.color = 'var(--warn)';
     }
   } catch (e) {
-    $('oauthStatus').textContent = '状态未知';
+    /* 网络错误时保持默认（显示 needAuth 区） */
   }
 }
+// 展开/折叠：已授权时允许查看详情
+$('adminExpand') && ($('adminExpand').onclick = () => {
+  hide($('adminReady')); show($('adminNeedAuth'));
+});
 $('oauthStartBtn').onclick = async () => {
   const msg = $('oauthMsg');
   msg.className = 'msg'; msg.textContent = '正在生成授权链接…';
