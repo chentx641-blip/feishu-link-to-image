@@ -91,11 +91,13 @@ async function getAppFolderToken() {
 }
 
 async function findDriveTokenFile(tt, folderToken) {
-  const list = await feishuCall('GET', '/open-apis/drive/explorer/v2/files', {
-    params: { folder_token: folderToken, page_size: 100 }, token: tt,
+  const list = await feishuCall('GET', '/open-apis/drive/explorer/v2/folder/' + folderToken + '/children', {
+    params: { types: 'file' }, token: tt,
   });
-  const files = (list.data && list.data.files) || [];
-  return files.find((f) => f.name === DRIVE_FILE_NAME && f.type === 'file') || null;
+  if (list.code !== 0 || !list.data || !list.data.children) return null;
+  const children = Object.values(list.data.children);
+  const f = children.find((c) => c.name === DRIVE_FILE_NAME && c.type === 'file');
+  return f ? { token: f.token, name: f.name, type: f.type } : null;
 }
 
 async function readDriveToken() {
@@ -103,11 +105,10 @@ async function readDriveToken() {
   const folderToken = await getAppFolderToken();
   const f = await findDriveTokenFile(tt, folderToken);
   if (!f) return null;
-  const dl = await feishuCall('GET', '/open-apis/drive/explorer/v2/files/' + f.token + '/download', { token: tt });
-  let url = null;
-  if (dl.code === 0 && dl.data) url = dl.data.url || dl.data.file_url;
-  if (!url) throw new Error('无法获取云空间文件下载地址: ' + JSON.stringify(dl).slice(0, 200));
-  const resp = await fetch(url);
+  // v1 download 接口直接返回文件内容（响应体即 JSON 文本，非带 url 的包装）
+  const resp = await fetch('https://open.feishu.cn/open-apis/drive/v1/files/' + f.token + '/download', {
+    headers: { Authorization: 'Bearer ' + tt },
+  });
   if (!resp.ok) throw new Error('下载云空间文件失败 HTTP ' + resp.status);
   return JSON.parse(await resp.text());
 }
@@ -125,7 +126,7 @@ async function writeDriveToken(t) {
   const folderToken = await getAppFolderToken();
   const old = await findDriveTokenFile(tt, folderToken);
   if (old) {
-    await feishuCall('DELETE', '/open-apis/drive/explorer/v2/files/' + old.token, { token: tt });
+    await feishuCall('DELETE', '/open-apis/drive/v1/files/' + old.token, { params: { type: 'file' }, token: tt });
   }
   const uploaderId = await getAppBotOpenId(tt);
   const content = JSON.stringify(t, null, 2);
@@ -138,7 +139,7 @@ async function writeDriveToken(t) {
     parts.push(Buffer.from(String(val) + '\r\n'));
   };
   field('file_name', DRIVE_FILE_NAME);
-  field('parent_type', 'folder');
+  field('parent_type', 'explorer');
   field('parent_node', folderToken);
   field('size', String(buf.length));
   if (uploaderId) field('uploader_id', uploaderId);
