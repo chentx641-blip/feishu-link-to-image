@@ -364,26 +364,42 @@ async function resolveDoc(url) {
 // ---------------------------------------------------------------------------
 // 扫描：自动找出表里所有「图片链接」单元格（基于字符串识别，不依赖固定列）
 // ---------------------------------------------------------------------------
+async function getSheetGridSize(spreadsheetToken, sheetId) {
+  // 实时查询子表真实行列数，彻底消除任何硬编码上限（文档有多少行列就扫多少）
+  const token = await getValidToken();
+  const q = await feishuCall('GET', '/open-apis/sheets/v3/spreadsheets/' + spreadsheetToken + '/sheets/query', { token });
+  if (q.code !== 0) throw new Error('获取工作表信息失败：' + (q.msg || JSON.stringify(q).slice(0, 200)));
+  const sheets = (q.data && q.data.sheets) || [];
+  const s = sheets.find((x) => x.sheet_id === sheetId);
+  if (!s) throw new Error('未找到子表（sheetId=' + sheetId + '）');
+  const gp = s.grid_properties || {};
+  return { row_count: gp.row_count || 0, column_count: gp.column_count || 0 };
+}
+
 async function readSheetGrid(token, spreadsheetToken, sheetId, rowCount, columnCount) {
-  // 每次最多读 100 列，按列分块
-  const CHUNK = 100;
+  // 双重分块：飞书 values 接口单次返回上限 10MB，且「sheetId!范围」形式最多 100 列
+  const COL_CHUNK = 100;  // 每块最多 100 列
+  const ROW_CHUNK = 1000; // 每块最多 1000 行（保守，避免单次超 10MB）
   const grid = new Map(); // "row,col" -> string
-  for (let cStart = 1; cStart <= columnCount; cStart += CHUNK) {
-    const cEnd = Math.min(cStart + CHUNK - 1, columnCount);
-    const range = `${sheetId}!${colLetter(cStart)}1:${colLetter(cEnd)}${rowCount}`;
-    const r = await feishuCall('GET',
-      '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values/' + range,
-      { params: { valueRenderOption: 'ToString' }, token });
-    if (r.code !== 0) throw new Error('读取单元格失败：' + (r.msg || JSON.stringify(r).slice(0, 200)));
-    const values = (r.data && r.data.valueRange && r.data.valueRange.values) || [];
-    for (let i = 0; i < values.length; i++) {
-      const rowArr = values[i];
-      const absRow = 1 + i; // 从 1 开始
-      for (let j = 0; j < rowArr.length; j++) {
-        const v = rowArr[j];
-        if (v === '' || v == null) continue;
-        const absCol = cStart + j;
-        grid.set(absRow + ',' + absCol, String(v));
+  for (let rStart = 1; rStart <= rowCount; rStart += ROW_CHUNK) {
+    const rEnd = Math.min(rStart + ROW_CHUNK - 1, rowCount);
+    for (let cStart = 1; cStart <= columnCount; cStart += COL_CHUNK) {
+      const cEnd = Math.min(cStart + COL_CHUNK - 1, columnCount);
+      const range = `${sheetId}!${colLetter(cStart)}${rStart}:${colLetter(cEnd)}${rEnd}`;
+      const r = await feishuCall('GET',
+        '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values/' + range,
+        { params: { valueRenderOption: 'ToString' }, token });
+      if (r.code !== 0) throw new Error('读取单元格失败：' + (r.msg || JSON.stringify(r).slice(0, 200)));
+      const values = (r.data && r.data.valueRange && r.data.valueRange.values) || [];
+      for (let i = 0; i < values.length; i++) {
+        const rowArr = values[i];
+        const absRow = rStart + i; // 绝对行号（含分块偏移）
+        for (let j = 0; j < rowArr.length; j++) {
+          const v = rowArr[j];
+          if (v === '' || v == null) continue;
+          const absCol = cStart + j; // 绝对列号（含分块偏移）
+          grid.set(absRow + ',' + absCol, String(v));
+        }
       }
     }
   }
@@ -620,12 +636,15 @@ const server = http.createServer(async (req, res) => {
       const spreadsheetToken = body.spreadsheetToken;
       const sheetId = body.sheetId;
       const sheetName = body.sheetName || sheetId;
-      const rowCount = parseInt(body.rowCount, 10) || 1000;
-      const columnCount = parseInt(body.columnCount, 10) || 100;
       if (!spreadsheetToken || !sheetId) return sendJSON(res, 400, { ok: false, error: '缺少 spreadsheetToken 或 sheetId' });
       try {
-        const cells = await scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnCount);
-        return sendJSON(res, 200, { ok: true, total: cells.length, cells });
+        // 动态获取该子表真实行列数（文档有多少行列就扫多少，不设固定上限）
+        const size = await getSheetGridSize(spreadsheetToken, sheetId);
+        if (!size.row_count || !size.column_count) {
+          return sendJSON(res, 200, { ok: false, error: '无法获取子表行列数，请确认文档已共享给所有者。' });
+        }
+        const cells = await scanSheet(spreadsheetToken, sheetId, sheetName, size.row_count, size.column_count);
+        return sendJSON(res, 200, { ok: true, total: cells.length, cells, row_count: size.row_count, column_count: size.column_count });
       } catch (e) {
         return sendJSON(res, 200, { ok: false, error: '扫描失败：' + String(e.message || e).slice(0, 400) });
       }
