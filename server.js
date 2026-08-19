@@ -355,8 +355,8 @@ async function resolveDoc(url) {
   const sheets = (q.data && q.data.sheets || []).map((s) => ({
     sheet_id: s.sheet_id,
     sheet_name: s.title || s.sheet_name || s.sheet_id,
-    row_count: s.row_count || s.grid && s.grid.row_count || 200,
-    column_count: s.column_count || s.grid && s.grid.column_count || 25,
+    row_count: (s.grid_properties && s.grid_properties.row_count) || 200,
+    column_count: (s.grid_properties && s.grid_properties.column_count) || 25,
   }));
   return { title: '', spreadsheetToken, sheets };
 }
@@ -620,8 +620,8 @@ const server = http.createServer(async (req, res) => {
       const spreadsheetToken = body.spreadsheetToken;
       const sheetId = body.sheetId;
       const sheetName = body.sheetName || sheetId;
-      const rowCount = parseInt(body.rowCount, 10) || 200;
-      const columnCount = parseInt(body.columnCount, 10) || 25;
+      const rowCount = parseInt(body.rowCount, 10) || 1000;
+      const columnCount = parseInt(body.columnCount, 10) || 100;
       if (!spreadsheetToken || !sheetId) return sendJSON(res, 400, { ok: false, error: '缺少 spreadsheetToken 或 sheetId' });
       try {
         const cells = await scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnCount);
