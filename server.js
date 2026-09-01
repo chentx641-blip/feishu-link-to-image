@@ -21,6 +21,7 @@
  */
 
 const http = require('http');
+const https = require('https');
 const fs = require('fs');
 const path = require('path');
 const os = require('os');
@@ -439,8 +440,44 @@ function logFail(entry) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
-async function downloadImage(url) {
+// 用 Node 内置 http/https 直接发请求（不经过 undici 的 fetch URL 序列化），
+// 拿 pathname+search 原文发出，避免预签名 URL 的查询串被改写导致 OSS 报 SignatureDoesNotMatch。
+// 同时：URL 清洗(&amp;->&、去首尾空格)、手动跟随重定向、403/429/5xx 重试退避。
+function rawGet(url, headers, maxRedirects) {
+  return new Promise((resolve, reject) => {
+    let u;
+    try { u = new URL(url); } catch (e) { return reject(e); }
+    const lib = u.protocol === 'http:' ? http : https;
+    const opts = {
+      method: 'GET',
+      hostname: u.hostname,
+      port: u.port || (u.protocol === 'https:' ? 443 : 80),
+      path: u.pathname + u.search, // 原文，不重编码
+      headers,
+    };
+    const req = lib.request(opts, (res) => {
+      const code = res.statusCode;
+      if ([301, 302, 303, 307, 308].includes(code) && maxRedirects > 0 && res.headers.location) {
+        res.resume();
+        const next = new URL(res.headers.location, u.href).href;
+        resolve(rawGet(next, headers, maxRedirects - 1));
+        return;
+      }
+      const chunks = [];
+      res.on('data', (c) => chunks.push(c));
+      res.on('end', () => resolve({ status: code, headers: res.headers, buf: Buffer.concat(chunks) }));
+    });
+    req.on('error', reject);
+    req.setTimeout(30000, () => req.destroy(new Error('下载超时(30s)')));
+    req.end();
+  });
+}
+
+async function downloadImage(inputUrl) {
   let lastErr;
+  // URL 清洗：从网页/飞书富文本粘来的链接常把 & 存成 &amp;，或带首尾不可见字符
+  let url = String(inputUrl || '').trim();
+  url = url.replace(/&amp;/gi, '&');
   let host = '';
   try { host = new URL(url).host; } catch (e) { /* ignore */ }
   const headerSets = [
@@ -465,22 +502,17 @@ async function downloadImage(url) {
   for (let attempt = 0; attempt < MAX; attempt++) {
     const headers = headerSets[Math.min(attempt, headerSets.length - 1)];
     try {
-      const resp = await fetch(url, { headers, redirect: 'follow' });
-      if (resp.ok) {
-        const buf = Buffer.from(await resp.arrayBuffer());
+      const { status, headers: rh, buf } = await rawGet(url, headers, 5);
+      if (status >= 200 && status < 300) {
         if (buf.length < 50) throw new Error('下载内容过小(' + buf.length + 'B)，可能不是图片');
         return buf;
       }
-      const body = await resp.text().catch(() => '');
-      lastErr = new Error('图片下载失败 HTTP ' + resp.status + (body ? ' | ' + body.slice(0, 200) : ''));
+      const body = buf.toString('utf8');
+      lastErr = new Error('图片下载失败 HTTP ' + status + (body ? ' | ' + body.slice(0, 200) : ''));
       // 把 OSS 返回的错误体落盘，便于脱离 Render 控制台复盘
-      logFail({
-        url, status: resp.status, attempt,
-        body: body.slice(0, 600),
-        respHeaders: Object.fromEntries(resp.headers.entries()),
-      });
+      logFail({ url, status, attempt, body: body.slice(0, 600), respHeaders: rh });
       // 403/429/5xx 视为可重试（限流或边缘节点拦截）；其余 4xx 直接抛出不再重试
-      if (resp.status === 403 || resp.status === 429 || resp.status >= 500) {
+      if (status === 403 || status === 429 || status >= 500) {
         await sleep(800 * Math.pow(2, attempt));
         continue;
       }
@@ -491,7 +523,8 @@ async function downloadImage(url) {
       await sleep(800 * Math.pow(2, attempt));
     }
   }
-  throw lastErr || new Error('图片下载失败（未知原因）');
+  // 把尝试过的真实 URL 带进错误，便于你直接复制比对单元格里的原文
+  throw new Error((lastErr ? lastErr.message : '图片下载失败（未知原因）') + ' || tried=' + url.slice(0, 240));
 }
 
 // ---------------------------------------------------------------------------
