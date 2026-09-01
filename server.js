@@ -413,7 +413,7 @@ async function readSheetGrid(token, spreadsheetToken, sheetId, rowCount, columnC
 // 逐个处理，否则整串当作一个 URL 发给 OSS，会让 Signature 被污染而报 SignatureDoesNotMatch。
 function extractUrlsFromCell(text) {
   if (!text || typeof text !== 'string') return [];
-  const re = /https?:\/\/[^\\s，,；;"')\]]+/g;
+  const re = /https?:\/\/[^\s，,；;"')\]]+/g;
   const out = [];
   let m;
   while ((m = re.exec(text)) !== null) out.push(m[0]);
@@ -448,8 +448,11 @@ async function scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnC
     if (!value || typeof value !== 'string') continue;
     // 1) 先从 ToString 文本里抽 URL（富文本多链接会被拆成多个）
     let urls = extractUrlsFromCell(value).filter((u) => isImageUrl(u));
-    // 2) 若没抽到带签名的完整 URL，尝试 Formula/UnformattedValue 渲染找回被折叠的完整超链接
-    if (urls.length === 0 || !urls.some((u) => /[?&](Expires|Signature)=/.test(u))) {
+    // 2) 仅当「单元格里明确含 http、但一层 ToString 没抽到任何可识别的 URL」时，
+    //    才用 Formula/UnformattedValue 渲染兜底（典型场景：超链接公式 =HYPERLINK("url","文字")，
+    //    ToString 只返回显示文字）。若已经抽到 URL（即使未签名），无需走兜底，避免无关单元格
+    //    每格狂打 2 次飞书 API 导致扫描极慢。
+    if (urls.length === 0 && /https?:\/\//.test(value)) {
       const [rowStr0, colStr0] = key.split(',');
       const addr = colLetter(parseInt(colStr0, 10)) + rowStr0;
       const recovered = await recoverCellUrl(token, spreadsheetToken, sheetId, addr);
