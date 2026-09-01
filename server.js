@@ -26,7 +26,18 @@ const fs = require('fs');
 const path = require('path');
 const os = require('os');
 const crypto = require('crypto');
-const sharp = require('sharp'); // 多图拼合（自动网格）；部署时随依赖自动安装
+// sharp 仅用于「一格多图」拼合，且仅在转换阶段按需加载。
+// 改为懒加载：避免 sharp 原生模块在部署环境（如 Render 预编译缺失）加载失败时，
+// 导致整个 server.js 启动即崩、Render 保留旧的（带 25 列上限/逐格 recover）构建，
+// 表现为「扫描极慢 + 整表找不到链接」。扫描与鉴权完全不依赖 sharp，必须优先保证可启动。
+let _sharp = null;
+let _sharpErr = null;
+function getSharp() {
+  if (_sharp) return _sharp;
+  if (_sharpErr) throw _sharpErr;
+  try { _sharp = require('sharp'); } catch (e) { _sharpErr = e; throw e; }
+  return _sharp;
+}
 
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
@@ -597,14 +608,14 @@ async function composeImages(buffers) {
   const prepared = [];
   for (const b of buffers) {
     let meta;
-    try { meta = await sharp(b, { failOn: 'none', unlimited: true }).metadata(); } catch (e) { meta = null; }
+    try { meta = await getSharp()(b, { failOn: 'none', unlimited: true }).metadata(); } catch (e) { meta = null; }
     const w = (meta && meta.width) || THUMB;
     const h = (meta && meta.height) || THUMB;
     const scale = Math.min(1, THUMB / Math.max(w, h));
     const tw = Math.max(1, Math.round(w * scale));
     const th = Math.max(1, Math.round(h * scale));
     // 等比缩放到 (tw,th)：因 tw/th 保持原比例，fill 不会变形
-    const buf = await sharp(b, { failOn: 'none', unlimited: true })
+    const buf = await getSharp()(b, { failOn: 'none', unlimited: true })
       .resize(tw, th, { fit: 'fill' })
       .png()
       .toBuffer();
@@ -633,7 +644,7 @@ async function composeImages(buffers) {
     }
     x += colW[c] + PAD;
   }
-  return await sharp({
+  return await getSharp()({
     create: { width: gridW, height: gridH, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } },
   }).composite(composites).png().toBuffer();
 }
@@ -865,14 +876,21 @@ const server = http.createServer(async (req, res) => {
       try {
         // 动态获取该子表真实行列数（文档有多少行列就扫多少，不设固定上限）
         const size = await getSheetGridSize(spreadsheetToken, sheetId);
-        if (!size.row_count || !size.column_count) {
-          return sendJSON(res, 200, { ok: false, error: '无法获取子表行列数，请确认文档已共享给所有者。' });
-        }
-        const cells = await scanSheet(spreadsheetToken, sheetId, sheetName, size.row_count, size.column_count);
+        // 兜底：极少数情况下 sheets/query 未返回 grid_properties（或返回 0），
+        // 不要直接报错中断，而是扫描一个充足范围，避免「整表无链接」的误判。
+        // 注意：AE/AF/AG 等截图列通常已超出早期 25 列上限，故兜底列数取 100。
+        const rowCount = size.row_count || 1000;
+        const columnCount = size.column_count || 100;
+        const cells = await scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnCount);
         const mergedCount = cells.filter((c) => c.imageCount > 1).length;
-        return sendJSON(res, 200, { ok: true, total: cells.length, cells, mergedCount, row_count: size.row_count, column_count: size.column_count });
+        // 诊断信息：若命中为 0，前端/日志可据此判断是否权限或范围问题，而非静默无链接。
+        console.log('[scan] sheet=' + sheetId + ' range=' + rowCount + 'x' + columnCount + ' 命中图链单元格=' + cells.length);
+        if (cells.length === 0) {
+          console.log('[scan] 未命中任何图链：请检查 operator 令牌是否有 sheets:spreadsheet:read 权限，以及目标列是否确为图片链接文本。');
+        }
+        return sendJSON(res, 200, { ok: true, total: cells.length, cells, mergedCount, row_count: rowCount, column_count: columnCount });
       } catch (e) {
-        return sendJSON(res, 200, { ok: false, error: '扫描失败：' + String(e.message || e).slice(0, 400) });
+        return sendJSON(res, 200, { ok: false, error: '扫描失败：' + String(e.message || e).slice(0, 600) });
       }
     }
 
