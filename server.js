@@ -407,9 +407,21 @@ async function readSheetGrid(token, spreadsheetToken, sheetId, rowCount, columnC
   return grid;
 }
 
+// 从一个单元格文本中抽出所有 http(s) URL（按常见分隔符切分：全角/半角逗号、分号、空白、
+// 换行、引号、括号）。单元格可能是富文本——多个 =HYPERLINK 用「、/，」连在一起——必须拆开
+// 逐个处理，否则整串当作一个 URL 发给 OSS，会让 Signature 被污染而报 SignatureDoesNotMatch。
+function extractUrlsFromCell(text) {
+  if (!text || typeof text !== 'string') return [];
+  const re = /https?:\/\/[^\\s，,；;"')\]]+/g;
+  const out = [];
+  let m;
+  while ((m = re.exec(text)) !== null) out.push(m[0]);
+  return out;
+}
+
 // 某些单元格里的链接被飞书以「超链接」形式存储，valueRenderOption=ToString 可能只返回
 // 显示文本（被截断/不含签名查询串）。尝试用 Formula / UnformattedValue 渲染方式找回
-// 含 Expires/Signature 的完整预签名 URL。
+// 含 Expires/Signature 的完整预签名 URL（返回整串文本，交给 extractUrlsFromCell 拆分）。
 async function recoverCellUrl(token, spreadsheetToken, sheetId, addr) {
   for (const ro of ['Formula', 'UnformattedValue']) {
     try {
@@ -421,14 +433,7 @@ async function recoverCellUrl(token, spreadsheetToken, sheetId, addr) {
       const cell = vals[0] && vals[0][0];
       if (!cell) continue;
       const s = String(cell);
-      const candidates = [];
-      const hyper = s.match(/=HYPERLINK\(\s*"([^"]+)"/);
-      if (hyper) candidates.push(hyper[1]);
-      const all = s.match(/https?:\/\/[^\s"')\]]+/g) || [];
-      for (const u of all) candidates.push(u);
-      for (const u of candidates) {
-        if (/[?&](Expires|Signature)=/.test(u)) return u;
-      }
+      if (/https?:\/\//.test(s)) return s; // 返回整串，交由 extractUrlsFromCell 按分隔符拆成多个 URL
     } catch (e) { /* 忽略，继续下一种渲染方式 */ }
   }
   return null;
@@ -439,18 +444,34 @@ async function scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnC
   const grid = await readSheetGrid(token, spreadsheetToken, sheetId, rowCount, columnCount);
   const cells = [];
   for (const [key, value] of grid.entries()) {
-    if (!isImageUrl(value)) continue;
+    if (!value || typeof value !== 'string') continue;
+    // 1) 先从 ToString 文本里抽 URL（富文本多链接会被拆成多个）
+    let urls = extractUrlsFromCell(value).filter((u) => isImageUrl(u));
+    // 2) 若没抽到带签名的完整 URL，尝试 Formula/UnformattedValue 渲染找回被折叠的完整超链接
+    if (urls.length === 0 || !urls.some((u) => /[?&](Expires|Signature)=/.test(u))) {
+      const [rowStr0, colStr0] = key.split(',');
+      const addr = colLetter(parseInt(colStr0, 10)) + rowStr0;
+      const recovered = await recoverCellUrl(token, spreadsheetToken, sheetId, addr);
+      if (recovered) {
+        const ru = extractUrlsFromCell(recovered).filter((u) => isImageUrl(u));
+        if (ru.length) urls = ru;
+      }
+    }
+    if (urls.length === 0) continue;
     const [rowStr, colStr] = key.split(',');
     const row = parseInt(rowStr, 10);
     const col = parseInt(colStr, 10);
-    const addr = colLetter(col) + row;
-    const cell = { sheetId, sheetName, range: addr, row, col, url: value, source: 'text' };
-    // 若 ToString 提取到的 URL 缺少签名参数，尝试用其他渲染方式找回被飞书折叠的完整超链接
-    if (!/[?&](Expires|Signature)=/.test(cell.url)) {
-      const recovered = await recoverCellUrl(token, spreadsheetToken, sheetId, addr);
-      if (recovered) cell.url = recovered;
+    for (let k = 0; k < urls.length; k++) {
+      const targetCol = col + k;
+      // 多图溢出：仅当目标列（原列右侧相邻列）为空时才写入，绝不覆盖已有数据；
+      // 若右侧被占用则跳过该额外图片并记日志，避免破坏其它列（如「手机型号」所在列）。
+      if (k >= 1 && grid.has(row + ',' + targetCol)) {
+        logFail({ skip: 'spill target occupied, extra image not written', row, col: targetCol, url: urls[k].slice(0, 200) });
+        continue;
+      }
+      const addr = colLetter(targetCol) + row;
+      cells.push({ sheetId, sheetName, range: addr, row, col: targetCol, url: urls[k], source: 'text' });
     }
-    cells.push(cell);
   }
   return cells;
 }
