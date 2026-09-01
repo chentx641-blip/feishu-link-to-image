@@ -422,6 +422,79 @@ async function scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnC
 }
 
 // ---------------------------------------------------------------------------
+// 图片下载（带重试与请求头兜底 + 失败落盘日志）
+// ---------------------------------------------------------------------------
+// 现象：alifile.sojump.cn（问卷星 Aliyun OSS）在国内 CDN 可直接下载，但在部分
+// 出口网络（如 Render 服务器）会被 CDN/WAF 间歇性返回 HTTP 403，浏览器/手动点击
+// 却正常。此类 403 多为限流或边缘节点临时拦截，重试即过。因此：
+//   1) 失败自动重试（指数退避，最多 4 次）；
+//   2) 逐次升级请求头（先纯 UA，再补 Accept，再补 Referer），兼容防盗链边缘；
+//   3) 把 OSS 返回的状态码/错误体/响应头写入 convert.log，便于脱离 Render 控制台复盘。
+const FLC_LOG_FILE = path.join(ROOT, 'convert.log');
+function logFail(entry) {
+  try {
+    const line = JSON.stringify({ ts: new Date().toISOString(), ...entry }) + '\n';
+    fs.appendFileSync(FLC_LOG_FILE, line);
+  } catch (e) { /* 日志写入失败不影响主流程 */ }
+}
+const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
+
+async function downloadImage(url) {
+  let lastErr;
+  let host = '';
+  try { host = new URL(url).host; } catch (e) { /* ignore */ }
+  const headerSets = [
+    {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9',
+    },
+    {
+      'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
+      'Accept': 'image/avif,image/webp,image/apng,image/*,*/*;q=0.8',
+      'Accept-Language': 'zh-CN,zh;q=0.9',
+      'Referer': 'https://' + host + '/',
+    },
+    {
+      'User-Agent': 'Mozilla/5.0',
+      'Accept': 'image/*',
+      'Referer': 'https://www.wjx.cn/',
+    },
+  ];
+  const MAX = 4;
+  for (let attempt = 0; attempt < MAX; attempt++) {
+    const headers = headerSets[Math.min(attempt, headerSets.length - 1)];
+    try {
+      const resp = await fetch(url, { headers, redirect: 'follow' });
+      if (resp.ok) {
+        const buf = Buffer.from(await resp.arrayBuffer());
+        if (buf.length < 50) throw new Error('下载内容过小(' + buf.length + 'B)，可能不是图片');
+        return buf;
+      }
+      const body = await resp.text().catch(() => '');
+      lastErr = new Error('图片下载失败 HTTP ' + resp.status + (body ? ' | ' + body.slice(0, 200) : ''));
+      // 把 OSS 返回的错误体落盘，便于脱离 Render 控制台复盘
+      logFail({
+        url, status: resp.status, attempt,
+        body: body.slice(0, 600),
+        respHeaders: Object.fromEntries(resp.headers.entries()),
+      });
+      // 403/429/5xx 视为可重试（限流或边缘节点拦截）；其余 4xx 直接抛出不再重试
+      if (resp.status === 403 || resp.status === 429 || resp.status >= 500) {
+        await sleep(800 * Math.pow(2, attempt));
+        continue;
+      }
+      throw lastErr;
+    } catch (e) {
+      lastErr = e;
+      // 网络层异常（DNS/TLS/超时）也重试
+      await sleep(800 * Math.pow(2, attempt));
+    }
+  }
+  throw lastErr || new Error('图片下载失败（未知原因）');
+}
+
+// ---------------------------------------------------------------------------
 // 转换：逐格下载图片并写入单元格（异步任务）
 // ---------------------------------------------------------------------------
 const jobs = new Map();
@@ -439,10 +512,7 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
         const r = { range: c.range, url: c.url, source: c.source, status: 'pending' };
         try {
           const ext = guessExt(c.url);
-          const imgResp = await fetch(c.url, { headers: { 'User-Agent': 'Mozilla/5.0' } });
-          if (!imgResp.ok) throw new Error('图片下载失败 HTTP ' + imgResp.status);
-          const buf = Buffer.from(await imgResp.arrayBuffer());
-          if (buf.length < 50) throw new Error('下载内容过小，可能不是图片');
+          const buf = await downloadImage(c.url);
           const base64 = buf.toString('base64');
           const range = `${sheetId}!${c.range}:${c.range}`;
           const wr = await feishuCall('POST',
