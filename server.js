@@ -602,24 +602,130 @@ async function downloadImage(inputUrl) {
 
 // 把多张图片拼成一张「自动网格图」：按图片数量自动排成 2~3 列网格，白底补边对齐。
 // buffers: 各图原始二进制；返回 PNG buffer。一格多图时用此函数合成为单图后再写回原单元格。
+//
+// 说明：为避免部署环境（Render）因原生模块 sharp 缺失/编译失败导致「Cannot find module 'sharp』，
+// 这里用 Node 内置 zlib 实现零依赖的 PNG 编解码与拼图，PNG 图链（本工具主力格式）完全不依赖任何
+// 外部原生包；仅 JPEG/WEBP 在确实需要时才尝试用可选依赖 sharp 兜底。
+const zlib = require('zlib');
+
+// ---- 零依赖 PNG 编解码（仅依赖 Node 内置 zlib）----
+const CRC_TABLE = (() => {
+  const t = new Uint32Array(256);
+  for (let n = 0; n < 256; n++) {
+    let c = n;
+    for (let k = 0; k < 8; k++) c = (c & 1) ? (0xEDB88320 ^ (c >>> 1)) : (c >>> 1);
+    t[n] = c >>> 0;
+  }
+  return t;
+})();
+function crc32(buf) {
+  let c = 0xFFFFFFFF;
+  for (let i = 0; i < buf.length; i++) c = CRC_TABLE[(c ^ buf[i]) & 0xFF] ^ (c >>> 8);
+  return (c ^ 0xFFFFFFFF) >>> 0;
+}
+function pngChunk(type, data) {
+  const len = Buffer.alloc(4); len.writeUInt32BE(data.length, 0);
+  const typeBuf = Buffer.from(type, 'ascii');
+  const crcBuf = Buffer.alloc(4); crcBuf.writeUInt32BE(crc32(Buffer.concat([typeBuf, data])), 0);
+  return Buffer.concat([len, typeBuf, data, crcBuf]);
+}
+function pngEncodeRGBA(width, height, rgba) {
+  const sig = Buffer.from([0x89, 0x50, 0x4E, 0x47, 0x0D, 0x0A, 0x1A, 0x0A]);
+  const ihdr = Buffer.alloc(13);
+  ihdr.writeUInt32BE(width, 0); ihdr.writeUInt32BE(height, 4);
+  ihdr[8] = 8; ihdr[9] = 6; ihdr[10] = 0; ihdr[11] = 0; ihdr[12] = 0;
+  const stride = width * 4;
+  const raw = Buffer.alloc((stride + 1) * height);
+  for (let y = 0; y < height; y++) {
+    raw[y * (stride + 1)] = 0; // filter = None
+    rgba.copy(raw, y * (stride + 1) + 1, y * stride, y * stride + stride);
+  }
+  const idat = zlib.deflateSync(raw);
+  return Buffer.concat([sig, pngChunk('IHDR', ihdr), pngChunk('IDAT', idat), pngChunk('IEND', Buffer.alloc(0))]);
+}
+function pngDecodeToRGBA(buf) {
+  if (!(buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47)) throw new Error('不是 PNG');
+  let off = 8, width = 0, height = 0, colorType = 0; const idat = [];
+  while (off < buf.length) {
+    const len = buf.readUInt32BE(off);
+    const type = buf.toString('ascii', off + 4, off + 8);
+    const data = buf.subarray(off + 8, off + 8 + len);
+    if (type === 'IHDR') { width = data.readUInt32BE(0); height = data.readUInt32BE(4); colorType = data[9]; }
+    else if (type === 'IDAT') idat.push(data);
+    else if (type === 'IEND') break;
+    off += 12 + len;
+  }
+  const raw = zlib.inflateSync(Buffer.concat(idat));
+  const channels = colorType === 6 ? 4 : colorType === 2 ? 3 : (() => { throw new Error('不支持的 PNG colorType ' + colorType); })();
+  const stride = width * channels;
+  const out = Buffer.alloc(width * height * 4);
+  const prev = Buffer.alloc(stride);
+  let p = 0;
+  for (let y = 0; y < height; y++) {
+    const ft = raw[p++];
+    const line = raw.subarray(p, p + stride); p += stride;
+    const cur = Buffer.alloc(stride);
+    for (let i = 0; i < stride; i++) {
+      const a = i >= channels ? cur[i - channels] : 0;
+      const b = prev[i];
+      const c = i >= channels ? prev[i - channels] : 0;
+      let v;
+      switch (ft) {
+        case 0: v = line[i]; break;
+        case 1: v = line[i] + a; break;
+        case 2: v = line[i] + b; break;
+        case 3: v = line[i] + ((a + b) >> 1); break;
+        case 4: { const pa = Math.abs(b - c), pb = Math.abs(a - c), pc = Math.abs(a + b - 2 * c); const pr = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c); v = line[i] + pr; break; }
+        default: throw new Error('不支持的 PNG filter ' + ft);
+      }
+      cur[i] = v & 0xFF;
+    }
+    for (let x = 0; x < width; x++) {
+      if (channels === 4) {
+        out[(y * width + x) * 4] = cur[x * 4]; out[(y * width + x) * 4 + 1] = cur[x * 4 + 1];
+        out[(y * width + x) * 4 + 2] = cur[x * 4 + 2]; out[(y * width + x) * 4 + 3] = cur[x * 4 + 3];
+      } else {
+        out[(y * width + x) * 4] = cur[x * 3]; out[(y * width + x) * 4 + 1] = cur[x * 3 + 1];
+        out[(y * width + x) * 4 + 2] = cur[x * 3 + 2]; out[(y * width + x) * 4 + 3] = 255;
+      }
+    }
+    cur.copy(prev);
+  }
+  return { width, height, data: out };
+}
+function resizeRGBA(src, sw, sh, dw, dh) {
+  const out = Buffer.alloc(dw * dh * 4);
+  for (let y = 0; y < dh; y++) {
+    const sy = Math.min(sh - 1, Math.floor(y * sh / dh));
+    for (let x = 0; x < dw; x++) {
+      const sx = Math.min(sw - 1, Math.floor(x * sw / dw));
+      const si = (sy * sw + sx) * 4, di = (y * dw + x) * 4;
+      out[di] = src[si]; out[di + 1] = src[si + 1]; out[di + 2] = src[si + 2]; out[di + 3] = src[si + 3];
+    }
+  }
+  return out;
+}
+function isPNG(buf) { return buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47; }
+async function decodeImage(buf) {
+  if (isPNG(buf)) return pngDecodeToRGBA(buf);
+  // JPEG/WEBP：尽力用可选依赖 sharp 兜底（Render 上通常未安装，故仅 PNG 保证可用）
+  try {
+    const m = await getSharp()(buf, { failOn: 'none', unlimited: true }).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    return { width: m.info.width, height: m.info.height, data: m.data };
+  } catch (e) {
+    throw new Error('当前部署环境未安装可选依赖 sharp，无法解码 JPEG/WEBP（本工具图链为 PNG，不受影响）：' + e.message);
+  }
+}
 async function composeImages(buffers) {
   const THUMB = 600; // 每张缩略图最长边上限（px），防止拼出超大图
   const PAD = 10;    // 网格间距（px）
   const prepared = [];
   for (const b of buffers) {
-    let meta;
-    try { meta = await getSharp()(b, { failOn: 'none', unlimited: true }).metadata(); } catch (e) { meta = null; }
-    const w = (meta && meta.width) || THUMB;
-    const h = (meta && meta.height) || THUMB;
-    const scale = Math.min(1, THUMB / Math.max(w, h));
-    const tw = Math.max(1, Math.round(w * scale));
-    const th = Math.max(1, Math.round(h * scale));
-    // 等比缩放到 (tw,th)：因 tw/th 保持原比例，fill 不会变形
-    const buf = await getSharp()(b, { failOn: 'none', unlimited: true })
-      .resize(tw, th, { fit: 'fill' })
-      .png()
-      .toBuffer();
-    prepared.push({ buf, tw, th });
+    const img = await decodeImage(b);
+    const scale = Math.min(1, THUMB / Math.max(img.width, img.height));
+    const tw = Math.max(1, Math.round(img.width * scale));
+    const th = Math.max(1, Math.round(img.height * scale));
+    prepared.push({ data: resizeRGBA(img.data, img.width, img.height, tw, th), tw, th });
   }
   const n = prepared.length;
   const cols = Math.max(1, Math.ceil(Math.sqrt(n))); // 2~3 列
@@ -633,20 +739,28 @@ async function composeImages(buffers) {
   });
   const gridW = colW.reduce((a, b) => a + b, 0) + PAD * (cols + 1);
   const gridH = rowH.reduce((a, b) => a + b, 0) + PAD * (rows + 1);
-  const composites = [];
+  const canvas = Buffer.alloc(gridW * gridH * 4, 255); // 白底
   let x = PAD;
   for (let c = 0; c < cols; c++) {
     let y = PAD;
     for (let r = 0; r < rows; r++) {
       const i = r * cols + c;
-      if (i < n) composites.push({ input: prepared[i].buf, left: x, top: y });
+      if (i < n) {
+        const im = prepared[i];
+        for (let yy = 0; yy < im.th; yy++) {
+          for (let xx = 0; xx < im.tw; xx++) {
+            const si = (yy * im.tw + xx) * 4;
+            const di = ((y + yy) * gridW + (x + xx)) * 4;
+            canvas[di] = im.data[si]; canvas[di + 1] = im.data[si + 1];
+            canvas[di + 2] = im.data[si + 2]; canvas[di + 3] = im.data[si + 3];
+          }
+        }
+      }
       y += rowH[r] + PAD;
     }
     x += colW[c] + PAD;
   }
-  return await getSharp()({
-    create: { width: gridW, height: gridH, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } },
-  }).composite(composites).png().toBuffer();
+  return pngEncodeRGBA(gridW, gridH, canvas);
 }
 
 // ---------------------------------------------------------------------------
@@ -770,8 +884,8 @@ const server = http.createServer(async (req, res) => {
         gateEnabled: !!ACCESS_CODE,
         appConfigured: !!(FEISHU_APP_ID && FEISHU_APP_SECRET),
         tokenReady: !!(tokenStore && tokenStore.access_token),
-        version: '2.1',
-        build: '2026-09-01-sharp-lazy-scan-fallback',
+        version: '2.2',
+        build: '2026-09-01-purejs-png-compose',
       });
     }
 
