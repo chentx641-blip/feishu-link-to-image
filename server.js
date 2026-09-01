@@ -17,6 +17,7 @@
  *   POST /api/resolve         -> 解析文档 -> {spreadsheetToken, sheets[]}
  *   POST /api/scan            -> 扫描某子表所有「图片链接」单元格
  *   POST /api/convert         -> 逐格下载图片并写入单元格（异步任务）
+ *   POST /api/retry-insert     -> 用户确认后：插入空白列并把「放不下」的多图补写进新列
  *   GET  /api/job/:id         -> 任务进度
  */
 
@@ -442,7 +443,8 @@ async function recoverCellUrl(token, spreadsheetToken, sheetId, addr) {
 async function scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnCount) {
   const token = await getValidToken();
   const grid = await readSheetGrid(token, spreadsheetToken, sheetId, rowCount, columnCount);
-  const cells = [];
+  const cells = [];        // 可正常转换（含一格多图中、右侧为空的那几张）
+  const blocked = [];      // 一格多图里，因右侧列被占用而「放不下」的额外图片（待用户决定插入列后补救）
   for (const [key, value] of grid.entries()) {
     if (!value || typeof value !== 'string') continue;
     // 1) 先从 ToString 文本里抽 URL（富文本多链接会被拆成多个）
@@ -463,17 +465,21 @@ async function scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnC
     const col = parseInt(colStr, 10);
     for (let k = 0; k < urls.length; k++) {
       const targetCol = col + k;
+      const addr = colLetter(targetCol) + row;
       // 多图溢出：仅当目标列（原列右侧相邻列）为空时才写入，绝不覆盖已有数据；
-      // 若右侧被占用则跳过该额外图片并记日志，避免破坏其它列（如「手机型号」所在列）。
+      // 若右侧被占用，则记为「blocked」，交由前端提醒用户「插入列后重跑」，绝不在后台静默丢弃。
       if (k >= 1 && grid.has(row + ',' + targetCol)) {
-        logFail({ skip: 'spill target occupied, extra image not written', row, col: targetCol, url: urls[k].slice(0, 200) });
+        blocked.push({
+          sheetId, sheetName, row,
+          baseCol: col, baseRange: colLetter(col) + row,
+          imageIndex: k, range: addr, col: targetCol, url: urls[k], source: 'text',
+        });
         continue;
       }
-      const addr = colLetter(targetCol) + row;
       cells.push({ sheetId, sheetName, range: addr, row, col: targetCol, url: urls[k], source: 'text' });
     }
   }
-  return cells;
+  return { cells, blocked };
 }
 
 // ---------------------------------------------------------------------------
@@ -633,6 +639,96 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
       job.error = String(e.message || e);
     } finally {
       try { fs.rmSync(tmpDir, { recursive: true, force: true }); } catch (e) { /* ignore */ }
+    }
+  })();
+  return job;
+}
+
+// 在指定子表的 baseCol（1-based）右侧插入 need 列空白列（飞书 insert_dimension_range）。
+// 接口约定：startIndex/endIndex 均为 0-based，插入列数 = endIndex - startIndex。
+// 在 1-based 的 baseCol 右侧插入 need 列 → 0-based startIndex = baseCol，endIndex = baseCol + need。
+async function insertColumnsRight(token, spreadsheetToken, sheetId, baseCol, need) {
+  const r = await feishuCall('POST',
+    '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/insert_dimension_range',
+    {
+      body: {
+        dimension: { sheetId, majorDimension: 'COLUMNS', startIndex: baseCol, endIndex: baseCol + need },
+        inheritStyle: 'BEFORE',
+      },
+      token,
+    });
+  if (r.code !== 0) throw new Error('插入列失败：' + (r.msg || JSON.stringify(r).slice(0, 200)));
+  return r;
+}
+
+// 补救任务：把「被跳过的多图」先插入空白列、再补写进新列（绝覆盖任何已有数据）。
+// blocked 每项含：sheetId, sheetName, row, baseCol(1-based), imageIndex(>=1), range(目标列地址), url。
+function startRetryJob(spreadsheetToken, sheetId, sheetName, blocked) {
+  const id = String(seq++);
+  const job = { id, status: 'running', total: blocked.length, done: 0, results: [], startedAt: Date.now() };
+  jobs.set(id, job);
+  (async () => {
+    try {
+      const token = await getValidToken();
+      // 1) 按 (sheetId, baseCol) 分组，计算每组需插入的列数（= 该组最大 imageIndex）
+      const groups = new Map(); // key `${sheetId}#${baseCol}` -> { sheetId, baseCol, need, entries:[] }
+      for (const b of blocked) {
+        const key = b.sheetId + '#' + b.baseCol;
+        let g = groups.get(key);
+        if (!g) { g = { sheetId: b.sheetId, baseCol: b.baseCol, need: 0, entries: [] }; groups.set(key, g); }
+        g.need = Math.max(g.need, b.imageIndex);
+        g.entries.push(b);
+      }
+      // 2) 从右往左插入（避免左侧插入导致右侧 baseCol 错位）
+      const sorted = [...groups.values()].sort((a, b) => b.baseCol - a.baseCol);
+      for (const g of sorted) {
+        // 防御：若代表性行的右侧相邻列已为空，说明之前已插入过，跳过插入（防止重复插入）
+        const rep = g.entries[0];
+        const probeRange = `${g.sheetId}!${colLetter(g.baseCol + 1)}${rep.row}:${colLetter(g.baseCol + 1)}${rep.row}`;
+        try {
+          const pr = await feishuCall('GET',
+            '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values/' + probeRange,
+            { params: { valueRenderOption: 'ToString' }, token });
+          const vals = (pr.data && pr.data.valueRange && pr.data.valueRange.values) || [];
+          const occupied = !!(vals[0] && vals[0][0] != null && String(vals[0][0]).trim() !== '');
+          if (!occupied) {
+            job.results.push({ range: colLetter(g.baseCol + 1) + rep.row, status: 'skipped', error: '右侧列已为空（可能已插入过），跳过插入' });
+            continue; // 不插入；下方仍会尝试写入（若为空则直接写）
+          }
+        } catch (e) { /* 探测失败不阻断，按需要插入 */ }
+        await insertColumnsRight(token, spreadsheetToken, g.sheetId, g.baseCol, g.need);
+      }
+      // 3) 逐个把「被跳过的多图」写入到 baseCol + imageIndex（已插入的空列）
+      for (const b of blocked) {
+        const r = { range: b.range, url: b.url, source: b.source, status: 'pending' };
+        try {
+          // 若目标列已有内容则跳过（防止覆盖 / 重复写入）
+          const pr = await feishuCall('GET',
+            '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values/' + b.range + ':' + b.range,
+            { params: { valueRenderOption: 'ToString' }, token });
+          const vals = (pr.data && pr.data.valueRange && pr.data.valueRange.values) || [];
+          const occupied = !!(vals[0] && vals[0][0] != null && String(vals[0][0]).trim() !== '');
+          if (occupied) {
+            r.status = 'skipped'; r.error = '目标单元格已有内容，跳过（防覆盖）';
+            job.results.push(r); job.done++; continue;
+          }
+          const ext = guessExt(b.url);
+          const buf = await downloadImage(b.url);
+          const base64 = buf.toString('base64');
+          const range = `${b.sheetId}!${b.range}:${b.range}`;
+          const wr = await feishuCall('POST',
+            '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values_image',
+            { body: { range, image: base64, name: 'flc' + ext }, token });
+          if (wr.code === 0) r.status = 'done';
+          else { r.status = 'failed'; r.error = '写入图片失败：' + (wr.msg || JSON.stringify(wr).slice(0, 200)); }
+        } catch (e) {
+          r.status = 'failed'; r.error = String(e.message || e).slice(0, 300);
+        }
+        job.done++; job.results.push(r);
+      }
+      job.status = 'finished';
+    } catch (e) {
+      job.status = 'error'; job.error = String(e.message || e);
     }
   })();
   return job;
@@ -809,8 +905,8 @@ const server = http.createServer(async (req, res) => {
         if (!size.row_count || !size.column_count) {
           return sendJSON(res, 200, { ok: false, error: '无法获取子表行列数，请确认文档已共享给所有者。' });
         }
-        const cells = await scanSheet(spreadsheetToken, sheetId, sheetName, size.row_count, size.column_count);
-        return sendJSON(res, 200, { ok: true, total: cells.length, cells, row_count: size.row_count, column_count: size.column_count });
+        const { cells, blocked } = await scanSheet(spreadsheetToken, sheetId, sheetName, size.row_count, size.column_count);
+        return sendJSON(res, 200, { ok: true, total: cells.length, cells, blocked, blockedCount: blocked.length, row_count: size.row_count, column_count: size.column_count });
       } catch (e) {
         return sendJSON(res, 200, { ok: false, error: '扫描失败：' + String(e.message || e).slice(0, 400) });
       }
@@ -827,6 +923,21 @@ const server = http.createServer(async (req, res) => {
         return sendJSON(res, 400, { ok: false, error: '缺少参数或待转换列表为空' });
       }
       const job = startJob(spreadsheetToken, sheetId, sheetName, cells);
+      return sendJSON(res, 200, { ok: true, jobId: job.id, total: job.total });
+    }
+
+    // 补救：用户确认后，插入空白列并把「被跳过的多图」补写进新列（绝不覆盖已有数据）
+    if (req.method === 'POST' && urlp === '/api/retry-insert') {
+      const body = await readBody(req);
+      if (!gateOK(req, res, body)) return;
+      const spreadsheetToken = body.spreadsheetToken;
+      const sheetId = body.sheetId;
+      const sheetName = body.sheetName || sheetId;
+      const blocked = Array.isArray(body.blocked) ? body.blocked : [];
+      if (!spreadsheetToken || !sheetId || blocked.length === 0) {
+        return sendJSON(res, 400, { ok: false, error: '缺少参数或被跳过的图片列表为空' });
+      }
+      const job = startRetryJob(spreadsheetToken, sheetId, sheetName, blocked);
       return sendJSON(res, 200, { ok: true, jobId: job.id, total: job.total });
     }
 
