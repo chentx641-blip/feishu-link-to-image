@@ -770,7 +770,8 @@ const server = http.createServer(async (req, res) => {
         gateEnabled: !!ACCESS_CODE,
         appConfigured: !!(FEISHU_APP_ID && FEISHU_APP_SECRET),
         tokenReady: !!(tokenStore && tokenStore.access_token),
-        version: '2.0',
+        version: '2.1',
+        build: '2026-09-01-sharp-lazy-scan-fallback',
       });
     }
 
