@@ -149,6 +149,19 @@
     <div class="stat" id="jobStat">准备中…</div>
     <div id="jobResults" style="margin-top:10px;"></div>
   </div>
+
+  <!-- 步骤 4b：被跳过多图提醒（由你决定是否插入列补救） -->
+  <div class="card hidden" id="blockedCard" style="border-color:var(--warn);">
+    <label style="color:var(--warn);">⚠️ 有 <b id="blockedCount">0</b> 张图片因「右侧列被占用」未能放入</label>
+    <div class="stat" style="margin:6px 0 0;">这些图来自「一个单元格含多张图」，但其紧邻右侧的列已有数据，工具为避免覆盖你的内容而<b>没有写入</b>，也未损坏任何数据。你可以：</div>
+    <div class="stat" style="margin:4px 0 0;">① 点「自动插入新列并重跑」——网站会<b>先插入空白列</b>、再把图补进新列；② 或忽略，保持现状（不影响已转换成功的图）。</div>
+    <div id="blockedList" style="max-height:200px;overflow:auto;margin-top:10px;"></div>
+    <div class="row" style="margin-top:12px;">
+      <button id="insertRetryBtn">自动插入新列并重跑</button>
+      <button class="ghost" id="ignoreBlockedBtn">忽略，保持现状</button>
+    </div>
+    <div class="msg" id="blockedMsg"></div>
+  </div>
 </div>
 
 <script>
@@ -332,8 +345,10 @@ $('scanBtn').onclick = async () => {
     if (!d.ok) { msg.className='msg err'; msg.textContent = d.error || '扫描失败'; return; }
     SCAN = d;
     renderPreview(d);
-    msg.className='msg ok'; msg.textContent = `扫描完成，共发现 ${d.total} 个图片链接单元格。`;
-    show($('previewCard')); hide($('jobCard'));
+    let note = `扫描完成，共发现 ${d.total} 个图片链接单元格。`;
+    if (d.blockedCount > 0) note += ` 另有 ${d.blockedCount} 张图因右侧列被占用将被跳过（转换后可在结果页一键插入列补救）。`;
+    msg.className='msg ok'; msg.textContent = note;
+    show($('previewCard')); hide($('jobCard')); hide($('blockedCard'));
   } catch(e) {
     msg.className='msg err'; msg.textContent = '请求失败：' + e.message;
   }
@@ -372,13 +387,14 @@ $('convertBtn').onclick = async () => {
         cells: chosen.map(c=>({range:c.range, url:c.url, source:c.source}))})});
     const d = await r.json();
     if (!d.ok) { alert(d.error || '转换启动失败'); return; }
-    startPolling(d.jobId);
+    startPolling(d.jobId, false);
   } catch(e) { alert('请求失败：' + e.message); }
 };
 
-function startPolling(jobId) {
+function startPolling(jobId, fromRetry) {
   show($('jobCard'));
   hide($('previewCard'));
+  if (!fromRetry) hide($('blockedCard'));
   const bar = $('bar'); const stat = $('jobStat'); const box = $('jobResults');
   bar.style.width = '0%'; stat.textContent = '开始转换…'; box.innerHTML = '';
   if (JOB_TIMER) clearInterval(JOB_TIMER);
@@ -394,13 +410,64 @@ function startPolling(jobId) {
         clearInterval(JOB_TIMER);
         const okCnt = d.results.filter(x=>x.status==='done').length;
         const failCnt = d.results.filter(x=>x.status==='failed').length;
-        box.innerHTML = `<div class="stat" style="margin-bottom:6px;">成功 <b class="res-ok">${okCnt}</b> · 失败 <b class="res-fail">${failCnt}</b></div>` +
-          d.results.map(x => `<div class="stat">${x.range} — <span class="${x.status==='done'?'res-ok':'res-fail'}">${x.status==='done'?'✓ 已转图片':('✗ '+ (x.error||'失败'))}</span></div>`).join('');
+        const skipCnt = d.results.filter(x=>x.status==='skipped').length;
+        box.innerHTML = `<div class="stat" style="margin-bottom:6px;">成功 <b class="res-ok">${okCnt}</b> · 失败 <b class="res-fail">${failCnt}</b>` +
+          (skipCnt ? ` · 跳过 <b>${skipCnt}</b>` : '') + `</div>` +
+          d.results.map(x => `<div class="stat">${x.range} — <span class="${x.status==='done'?'res-ok':(x.status==='skipped'?'res-ok':'res-fail')}">${x.status==='done'?'✓ 已转图片':(x.status==='skipped'?'⊘ '+(x.error||'跳过'):('✗ '+ (x.error||'失败')))}</span></div>`).join('');
         stat.innerHTML += d.status==='finished' ? ' · <b class="res-ok">全部完成</b>' : ' · <b class="res-fail">存在失败</b>';
+        // 仅首次转换（非补救重跑）在结束后，若扫描时发现「放不下」的多图，弹出提醒由你决定
+        if (!fromRetry && SCAN && SCAN.blockedCount > 0) showBlockedBanner();
       }
     } catch(e) { /* ignore transient */ }
   }, 800);
 }
+
+// 显示「被跳过多图」提醒横幅，并列出待补救的单元格
+function showBlockedBanner() {
+  const list = $('blockedList'); list.innerHTML = '';
+  $('blockedCount').textContent = SCAN.blockedCount;
+  SCAN.blocked.slice(0, 60).forEach((b) => {
+    const div = document.createElement('div');
+    div.className = 'stat';
+    div.style.padding = '4px 0';
+    div.innerHTML = `<span class="range" style="font-family:ui-monospace,Menlo,Consolas,monospace;color:var(--primary-d);">${b.baseRange}</span> ` +
+      `第 ${b.imageIndex + 1} 张 → 目标列 ${b.range} &nbsp;<span style="color:var(--muted);">${String(b.url).slice(0, 64)}…</span>`;
+    list.appendChild(div);
+  });
+  if (SCAN.blockedCount > 60) {
+    const more = document.createElement('div');
+    more.className = 'stat'; more.style.color = 'var(--muted)';
+    more.textContent = `… 其余 ${SCAN.blockedCount - 60} 张略`;
+    list.appendChild(more);
+  }
+  $('blockedMsg').textContent = '';
+  $('insertRetryBtn').disabled = false;
+  show($('blockedCard'));
+}
+
+// 「自动插入新列并重跑」：把扫描时记录的、被跳过的多图连同其 URL 交给后端，
+// 后端先插入空白列、再补写图片（绝不覆盖已有数据）。
+$('insertRetryBtn').onclick = async () => {
+  if (!RESOLVED || !SCAN || !SCAN.blockedCount) return;
+  const sheetId = $('sheetSelect').value;
+  const sheet = RESOLVED.sheets.find(s => s.sheet_id === sheetId);
+  const blocked = SCAN.blocked.map(b => ({
+    sheetId: b.sheetId, sheetName: b.sheetName, row: b.row,
+    baseCol: b.baseCol, imageIndex: b.imageIndex, range: b.range, url: b.url, source: b.source,
+  }));
+  $('insertRetryBtn').disabled = true;
+  $('ignoreBlockedBtn').disabled = true;
+  $('blockedMsg').className = 'msg'; $('blockedMsg').textContent = '正在插入空白列并补图（不覆盖任何已有数据）…';
+  try {
+    const r = await apiFetch('/api/retry-insert', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({spreadsheetToken: RESOLVED.spreadsheetToken, sheetId, sheetName: sheet.sheet_name, blocked})});
+    const d = await r.json();
+    if (!d.ok) { $('blockedMsg').className='msg err'; $('blockedMsg').textContent = d.error || '启动失败'; $('insertRetryBtn').disabled=false; $('ignoreBlockedBtn').disabled=false; return; }
+    hide($('blockedCard'));
+    startPolling(d.jobId, true);
+  } catch(e) { $('blockedMsg').className='msg err'; $('blockedMsg').textContent='请求失败：' + e.message; $('insertRetryBtn').disabled=false; $('ignoreBlockedBtn').disabled=false; }
+};
+$('ignoreBlockedBtn').onclick = () => { hide($('blockedCard')); };
 </script>
 </body>
 </html>
