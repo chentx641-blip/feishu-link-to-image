@@ -407,6 +407,33 @@ async function readSheetGrid(token, spreadsheetToken, sheetId, rowCount, columnC
   return grid;
 }
 
+// 某些单元格里的链接被飞书以「超链接」形式存储，valueRenderOption=ToString 可能只返回
+// 显示文本（被截断/不含签名查询串）。尝试用 Formula / UnformattedValue 渲染方式找回
+// 含 Expires/Signature 的完整预签名 URL。
+async function recoverCellUrl(token, spreadsheetToken, sheetId, addr) {
+  for (const ro of ['Formula', 'UnformattedValue']) {
+    try {
+      const r = await feishuCall('GET',
+        '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values/' + sheetId + '!' + addr + ':' + addr,
+        { params: { valueRenderOption: ro }, token });
+      if (r.code !== 0) continue;
+      const vals = (r.data && r.data.valueRange && r.data.valueRange.values) || [];
+      const cell = vals[0] && vals[0][0];
+      if (!cell) continue;
+      const s = String(cell);
+      const candidates = [];
+      const hyper = s.match(/=HYPERLINK\(\s*"([^"]+)"/);
+      if (hyper) candidates.push(hyper[1]);
+      const all = s.match(/https?:\/\/[^\s"')\]]+/g) || [];
+      for (const u of all) candidates.push(u);
+      for (const u of candidates) {
+        if (/[?&](Expires|Signature)=/.test(u)) return u;
+      }
+    } catch (e) { /* 忽略，继续下一种渲染方式 */ }
+  }
+  return null;
+}
+
 async function scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnCount) {
   const token = await getValidToken();
   const grid = await readSheetGrid(token, spreadsheetToken, sheetId, rowCount, columnCount);
@@ -417,7 +444,13 @@ async function scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnC
     const row = parseInt(rowStr, 10);
     const col = parseInt(colStr, 10);
     const addr = colLetter(col) + row;
-    cells.push({ sheetId, sheetName, range: addr, row, col, url: value, source: 'text' });
+    const cell = { sheetId, sheetName, range: addr, row, col, url: value, source: 'text' };
+    // 若 ToString 提取到的 URL 缺少签名参数，尝试用其他渲染方式找回被飞书折叠的完整超链接
+    if (!/[?&](Expires|Signature)=/.test(cell.url)) {
+      const recovered = await recoverCellUrl(token, spreadsheetToken, sheetId, addr);
+      if (recovered) cell.url = recovered;
+    }
+    cells.push(cell);
   }
   return cells;
 }
@@ -477,7 +510,16 @@ async function downloadImage(inputUrl) {
   let lastErr;
   // URL 清洗：从网页/飞书富文本粘来的链接常把 & 存成 &amp;，或带首尾不可见字符
   let url = String(inputUrl || '').trim();
-  url = url.replace(/&amp;/gi, '&');
+  // 反复解码 &amp;（可能双重编码成 &amp;amp;），避免预签名 URL 的 & 被存成 HTML 实体导致签名校验失败
+  let guard = 0;
+  while (url.includes('&amp;') && guard++ < 5) url = url.replace(/&amp;/gi, '&');
+  // 链接缺少签名参数（Expires/Signature）：说明单元格里存的是不完整的预签名 URL，
+  // 重试/换请求头都无解，直接给出明确提示，避免无意义的重试与 403 堆积
+  if (!/[?&](Expires|Signature)=/.test(url)) {
+    throw new Error('图片链接不完整（缺少 Expires/Signature 签名参数）：单元格里存的 URL 似乎只到 "?" 为止，或签名部分被截断。' +
+      '请重新从问卷星/源文件复制【完整】的预签名链接（形如 ...jpg?Expires=...&OSSAccessKeyId=...&Signature=...）粘贴进单元格。' +
+      ' || tried=' + url.slice(0, 4000));
+  }
   let host = '';
   try { host = new URL(url).host; } catch (e) { /* ignore */ }
   const headerSets = [
@@ -524,7 +566,7 @@ async function downloadImage(inputUrl) {
     }
   }
   // 把尝试过的真实 URL 带进错误，便于你直接复制比对单元格里的原文
-  throw new Error((lastErr ? lastErr.message : '图片下载失败（未知原因）') + ' || tried=' + url.slice(0, 240));
+  throw new Error((lastErr ? lastErr.message : '图片下载失败（未知原因）') + ' || tried=' + url.slice(0, 4000));
 }
 
 // ---------------------------------------------------------------------------
