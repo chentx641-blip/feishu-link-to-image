@@ -603,9 +603,9 @@ async function downloadImage(inputUrl) {
 // 把多张图片拼成一张「自动网格图」：按图片数量自动排成 2~3 列网格，白底补边对齐。
 // buffers: 各图原始二进制；返回 PNG buffer。一格多图时用此函数合成为单图后再写回原单元格。
 //
-// 说明：为避免部署环境（Render）因原生模块 sharp 缺失/编译失败导致「Cannot find module 'sharp』，
-// 这里用 Node 内置 zlib 实现零依赖的 PNG 编解码与拼图，PNG 图链（本工具主力格式）完全不依赖任何
-// 外部原生包；仅 JPEG/WEBP 在确实需要时才尝试用可选依赖 sharp 兜底。
+// 说明：sharp 已作为普通依赖安装（Render 安装时不会省略），且 sharp 0.33 走官方预编译二进制、
+// 无需本地编译，因此「一格多图」拼合的主路径直接用 sharp 解码（PNG/JPEG/WEBP 全格式支持，
+// 不会出现 filter 128 等纯 JS 解码器无法处理的非标准图）。纯 JS 解码仅在 sharp 万一缺失时作兜底。
 const zlib = require('zlib');
 
 // ---- 零依赖 PNG 编解码（仅依赖 Node 内置 zlib）----
@@ -645,18 +645,24 @@ function pngEncodeRGBA(width, height, rgba) {
 }
 function pngDecodeToRGBA(buf) {
   if (!(buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47)) throw new Error('不是 PNG');
-  let off = 8, width = 0, height = 0, colorType = 0; const idat = [];
+  let off = 8, width = 0, height = 0, colorType = 6, bitDepth = 8; const idat = []; let plte = null;
   while (off < buf.length) {
     const len = buf.readUInt32BE(off);
     const type = buf.toString('ascii', off + 4, off + 8);
     const data = buf.subarray(off + 8, off + 8 + len);
-    if (type === 'IHDR') { width = data.readUInt32BE(0); height = data.readUInt32BE(4); colorType = data[9]; }
+    if (type === 'IHDR') {
+      width = data.readUInt32BE(0); height = data.readUInt32BE(4);
+      bitDepth = data[8]; colorType = data[9];
+      const interlace = data[12];
+      if (interlace !== 0) throw new Error('不支持交错(Adam7) PNG，请安装 sharp 依赖解码');
+    } else if (type === 'PLTE') { plte = data; }
     else if (type === 'IDAT') idat.push(data);
     else if (type === 'IEND') break;
     off += 12 + len;
   }
+  if (bitDepth !== 8) throw new Error('仅支持 8-bit PNG，请安装 sharp 依赖解码（bitDepth=' + bitDepth + '）');
+  const channels = colorType === 6 ? 4 : colorType === 2 ? 3 : colorType === 4 ? 2 : colorType === 0 ? 1 : colorType === 3 ? 1 : (() => { throw new Error('不支持的 PNG colorType ' + colorType); })();
   const raw = zlib.inflateSync(Buffer.concat(idat));
-  const channels = colorType === 6 ? 4 : colorType === 2 ? 3 : (() => { throw new Error('不支持的 PNG colorType ' + colorType); })();
   const stride = width * channels;
   const out = Buffer.alloc(width * height * 4);
   const prev = Buffer.alloc(stride);
@@ -676,17 +682,25 @@ function pngDecodeToRGBA(buf) {
         case 2: v = line[i] + b; break;
         case 3: v = line[i] + ((a + b) >> 1); break;
         case 4: { const pa = Math.abs(b - c), pb = Math.abs(a - c), pc = Math.abs(a + b - 2 * c); const pr = (pa <= pb && pa <= pc) ? a : (pb <= pc ? b : c); v = line[i] + pr; break; }
-        default: throw new Error('不支持的 PNG filter ' + ft);
+        default: v = line[i]; break; // 未知 filter 兜底为 None，避免非标准 PNG 崩溃
       }
       cur[i] = v & 0xFF;
     }
     for (let x = 0; x < width; x++) {
-      if (channels === 4) {
+      if (colorType === 6) {
         out[(y * width + x) * 4] = cur[x * 4]; out[(y * width + x) * 4 + 1] = cur[x * 4 + 1];
         out[(y * width + x) * 4 + 2] = cur[x * 4 + 2]; out[(y * width + x) * 4 + 3] = cur[x * 4 + 3];
-      } else {
+      } else if (colorType === 2) {
         out[(y * width + x) * 4] = cur[x * 3]; out[(y * width + x) * 4 + 1] = cur[x * 3 + 1];
         out[(y * width + x) * 4 + 2] = cur[x * 3 + 2]; out[(y * width + x) * 4 + 3] = 255;
+      } else if (colorType === 4) {
+        out[(y * width + x) * 4] = cur[x * 2]; out[(y * width + x) * 4 + 1] = cur[x * 2];
+        out[(y * width + x) * 4 + 2] = cur[x * 2]; out[(y * width + x) * 4 + 3] = cur[x * 2 + 1];
+      } else if (colorType === 0) {
+        const g = cur[x]; out[(y * width + x) * 4] = g; out[(y * width + x) * 4 + 1] = g; out[(y * width + x) * 4 + 2] = g; out[(y * width + x) * 4 + 3] = 255;
+      } else if (colorType === 3 && plte) {
+        const idx = cur[x]; const pr = plte[idx * 3], pg = plte[idx * 3 + 1], pb = plte[idx * 3 + 2];
+        out[(y * width + x) * 4] = pr; out[(y * width + x) * 4 + 1] = pg; out[(y * width + x) * 4 + 2] = pb; out[(y * width + x) * 4 + 3] = 255;
       }
     }
     cur.copy(prev);
@@ -707,13 +721,16 @@ function resizeRGBA(src, sw, sh, dw, dh) {
 }
 function isPNG(buf) { return buf[0] === 0x89 && buf[1] === 0x50 && buf[2] === 0x4E && buf[3] === 0x47; }
 async function decodeImage(buf) {
-  if (isPNG(buf)) return pngDecodeToRGBA(buf);
-  // JPEG/WEBP：尽力用可选依赖 sharp 兜底（Render 上通常未安装，故仅 PNG 保证可用）
+  // 主路径：用 sharp 解码（普通依赖，Render 预编译安装，PNG/JPEG/WEBP 全格式支持，且不会因
+  // 非标准 filter / 非 8-bit / 交错等导致「不支持的 PNG filter 128」这类纯 JS 解码器无法处理的报错）。
   try {
-    const m = await getSharp()(buf, { failOn: 'none', unlimited: true }).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
+    const S = getSharp();
+    const m = await S(buf, { failOn: 'none', unlimited: true }).ensureAlpha().raw().toBuffer({ resolveWithObject: true });
     return { width: m.info.width, height: m.info.height, data: m.data };
-  } catch (e) {
-    throw new Error('当前部署环境未安装可选依赖 sharp，无法解码 JPEG/WEBP（本工具图链为 PNG，不受影响）：' + e.message);
+  } catch (se) {
+    // 兜底：sharp 万一缺失时，仅 8-bit PNG 用纯 JS 解码（已尽量兼容更多 colorType / 未知 filter）。
+    if (isPNG(buf)) return pngDecodeToRGBA(buf);
+    throw new Error('当前部署环境未安装 sharp 依赖，无法解码非 PNG 图片（JPEG/WEBP 需要 sharp）：' + se.message);
   }
 }
 async function composeImages(buffers) {
@@ -884,8 +901,9 @@ const server = http.createServer(async (req, res) => {
         gateEnabled: !!ACCESS_CODE,
         appConfigured: !!(FEISHU_APP_ID && FEISHU_APP_SECRET),
         tokenReady: !!(tokenStore && tokenStore.access_token),
-        version: '2.2',
-        build: '2026-09-01-purejs-png-compose',
+        sharpReady: (() => { try { getSharp(); return true; } catch (e) { return false; } })(),
+        version: '2.3',
+        build: '2026-09-01-sharp-deps-primary',
       });
     }
 
