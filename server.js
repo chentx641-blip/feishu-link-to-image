@@ -902,8 +902,9 @@ const server = http.createServer(async (req, res) => {
         appConfigured: !!(FEISHU_APP_ID && FEISHU_APP_SECRET),
         tokenReady: !!(tokenStore && tokenStore.access_token),
         sharpReady: (() => { try { getSharp(); return true; } catch (e) { return false; } })(),
-        version: '2.3',
-        build: '2026-09-01-sharp-deps-primary',
+        sharpError: (() => { try { getSharp(); return null; } catch (e) { return String(e && e.message || e); } })(),
+        version: '2.4',
+        build: '2026-09-01-sharp-include-optional',
       });
     }
 
