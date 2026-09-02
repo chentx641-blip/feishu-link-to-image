@@ -903,8 +903,8 @@ const server = http.createServer(async (req, res) => {
         tokenReady: !!(tokenStore && tokenStore.access_token),
         sharpReady: (() => { try { getSharp(); return true; } catch (e) { return false; } })(),
         sharpError: (() => { try { getSharp(); return null; } catch (e) { return String(e && e.message || e); } })(),
-        version: '2.4',
-        build: '2026-09-01-sharp-include-optional',
+        version: '2.5',
+        build: '2026-09-02-sharp-force-reinstall',
       });
     }
 

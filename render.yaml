@@ -11,7 +11,7 @@ services:
     name: feishu-link-to-image
     runtime: node
     plan: free
-    buildCommand: "true"
+    buildCommand: "rm -rf node_modules package-lock.json && npm install --include=optional"
     startCommand: "node server.js"
     envVars:
       - key: FLC_ACCESS_CODE
