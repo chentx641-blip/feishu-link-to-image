@@ -734,50 +734,97 @@ async function decodeImage(buf) {
   }
 }
 async function composeImages(buffers) {
-  const THUMB = 600; // 每张缩略图最长边上限（px），防止拼出超大图
-  const PAD = 10;    // 网格间距（px）
-  const prepared = [];
-  for (const b of buffers) {
-    const img = await decodeImage(b);
-    const scale = Math.min(1, THUMB / Math.max(img.width, img.height));
-    const tw = Math.max(1, Math.round(img.width * scale));
-    const th = Math.max(1, Math.round(img.height * scale));
-    prepared.push({ data: resizeRGBA(img.data, img.width, img.height, tw, th), tw, th });
-  }
-  const n = prepared.length;
-  const cols = Math.max(1, Math.ceil(Math.sqrt(n))); // 2~3 列
-  const rows = Math.ceil(n / cols);
-  const colW = new Array(cols).fill(0);
-  const rowH = new Array(rows).fill(0);
-  prepared.forEach((im, i) => {
-    const c = i % cols, r = Math.floor(i / cols);
-    colW[c] = Math.max(colW[c], im.tw);
-    rowH[r] = Math.max(rowH[r], im.th);
-  });
-  const gridW = colW.reduce((a, b) => a + b, 0) + PAD * (cols + 1);
-  const gridH = rowH.reduce((a, b) => a + b, 0) + PAD * (rows + 1);
-  const canvas = Buffer.alloc(gridW * gridH * 4, 255); // 白底
-  let x = PAD;
-  for (let c = 0; c < cols; c++) {
-    let y = PAD;
-    for (let r = 0; r < rows; r++) {
-      const i = r * cols + c;
-      if (i < n) {
-        const im = prepared[i];
-        for (let yy = 0; yy < im.th; yy++) {
-          for (let xx = 0; xx < im.tw; xx++) {
-            const si = (yy * im.tw + xx) * 4;
-            const di = ((y + yy) * gridW + (x + xx)) * 4;
-            canvas[di] = im.data[si]; canvas[di + 1] = im.data[si + 1];
-            canvas[di + 2] = im.data[si + 2]; canvas[di + 3] = im.data[si + 3];
+  const THUMB = 1080; // 每张缩略图最长边上限（px）。整条链路走 sharp 高质量 Lanczos 缩放，不再丢细节
+  const PAD = 12;     // 网格间距（px）
+
+  // 主路径：sharp 全程（高质量解码 + Lanczos 缩小 + 高质量合成），PNG/JPEG/WEBP 全支持
+  try {
+    const S = getSharp();
+    const prepared = [];
+    for (const b of buffers) {
+      const meta = await S(b, { failOn: 'none', unlimited: true }).metadata();
+      const w = meta.width || THUMB, h = meta.height || THUMB;
+      const scale = Math.min(1, THUMB / Math.max(w, h));
+      const tw = Math.max(1, Math.round(w * scale));
+      const th = Math.max(1, Math.round(h * scale));
+      // sharp 默认 Lanczos3 滤波缩小，文字/细节不会糊
+      const buf = await S(b, { failOn: 'none', unlimited: true })
+        .resize(tw, th, { fit: 'fill' })
+        .png()
+        .toBuffer();
+      prepared.push({ buf, tw, th });
+    }
+    const n = prepared.length;
+    const cols = Math.max(1, Math.ceil(Math.sqrt(n))); // 2~3 列
+    const rows = Math.ceil(n / cols);
+    const colW = new Array(cols).fill(0);
+    const rowH = new Array(rows).fill(0);
+    prepared.forEach((im, i) => {
+      const c = i % cols, r = Math.floor(i / cols);
+      colW[c] = Math.max(colW[c], im.tw);
+      rowH[r] = Math.max(rowH[r], im.th);
+    });
+    const gridW = colW.reduce((a, b) => a + b, 0) + PAD * (cols + 1);
+    const gridH = rowH.reduce((a, b) => a + b, 0) + PAD * (rows + 1);
+    const composites = [];
+    let x = PAD;
+    for (let c = 0; c < cols; c++) {
+      let y = PAD;
+      for (let r = 0; r < rows; r++) {
+        const i = r * cols + c;
+        if (i < n) composites.push({ input: prepared[i].buf, left: x, top: y });
+        y += rowH[r] + PAD;
+      }
+      x += colW[c] + PAD;
+    }
+    return await S({
+      create: { width: gridW, height: gridH, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } },
+    }).composite(composites).png().toBuffer();
+  } catch (se) {
+    // 兜底（仅当 sharp 缺失时）：纯 JS 8-bit PNG 解码 + 最近邻缩小 + 合成。清晰度较差但保证可用。
+    const prepared = [];
+    for (const b of buffers) {
+      const img = await decodeImage(b);
+      const scale = Math.min(1, THUMB / Math.max(img.width, img.height));
+      const tw = Math.max(1, Math.round(img.width * scale));
+      const th = Math.max(1, Math.round(img.height * scale));
+      prepared.push({ data: resizeRGBA(img.data, img.width, img.height, tw, th), tw, th });
+    }
+    const n = prepared.length;
+    const cols = Math.max(1, Math.ceil(Math.sqrt(n)));
+    const rows = Math.ceil(n / cols);
+    const colW = new Array(cols).fill(0);
+    const rowH = new Array(rows).fill(0);
+    prepared.forEach((im, i) => {
+      const c = i % cols, r = Math.floor(i / cols);
+      colW[c] = Math.max(colW[c], im.tw);
+      rowH[r] = Math.max(rowH[r], im.th);
+    });
+    const gridW = colW.reduce((a, b) => a + b, 0) + PAD * (cols + 1);
+    const gridH = rowH.reduce((a, b) => a + b, 0) + PAD * (rows + 1);
+    const canvas = Buffer.alloc(gridW * gridH * 4, 255);
+    let x = PAD;
+    for (let c = 0; c < cols; c++) {
+      let y = PAD;
+      for (let r = 0; r < rows; r++) {
+        const i = r * cols + c;
+        if (i < n) {
+          const im = prepared[i];
+          for (let yy = 0; yy < im.th; yy++) {
+            for (let xx = 0; xx < im.tw; xx++) {
+              const si = (yy * im.tw + xx) * 4;
+              const di = ((y + yy) * gridW + (x + xx)) * 4;
+              canvas[di] = im.data[si]; canvas[di + 1] = im.data[si + 1];
+              canvas[di + 2] = im.data[si + 2]; canvas[di + 3] = im.data[si + 3];
+            }
           }
         }
+        y += rowH[r] + PAD;
       }
-      y += rowH[r] + PAD;
+      x += colW[c] + PAD;
     }
-    x += colW[c] + PAD;
+    return pngEncodeRGBA(gridW, gridH, canvas);
   }
-  return pngEncodeRGBA(gridW, gridH, canvas);
 }
 
 // ---------------------------------------------------------------------------
@@ -903,8 +950,8 @@ const server = http.createServer(async (req, res) => {
         tokenReady: !!(tokenStore && tokenStore.access_token),
         sharpReady: (() => { try { getSharp(); return true; } catch (e) { return false; } })(),
         sharpError: (() => { try { getSharp(); return null; } catch (e) { return String(e && e.message || e); } })(),
-        version: '2.5',
-        build: '2026-09-02-sharp-force-reinstall',
+        version: '2.6',
+        build: '2026-09-02-sharp-lanczos-compose',
       });
     }
 
