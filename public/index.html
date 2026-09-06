@@ -71,7 +71,7 @@
 <div class="wrap">
   <header>
     <h1>飞书表格 · 图片链接转图片</h1>
-    <p>粘贴飞书电子表格链接，自动扫描并把「图片链接」单元格替换为单元格内嵌图片。支持任意列位置，无需固定模板。</p>
+    <p>支持电子表格与多维表格：粘贴链接后自动识别。电子表格会把「图片链接」单元格替换为内嵌图片；多维表格可指定「链接字段 → 附件字段」批量转换。</p>
   </header>
 
   <!-- 访问口令（部署到公网时由所有者提供） -->
@@ -111,6 +111,30 @@
       <button id="resolveBtn">解析文档</button>
     </div>
     <div class="msg" id="resolveMsg"></div>
+  </div>
+
+  <!-- 多维表格模式（粘贴多维表格链接后自动出现） -->
+  <div class="card hidden" id="bitableCard">
+    <div class="stat" style="margin-bottom:6px;">📊 已识别为 <b>多维表格</b>，请选择数据表与字段：</div>
+    <label>选择数据表</label>
+    <div class="row">
+      <select id="btTable" style="padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;min-width:200px;"></select>
+      <button id="btLoadFields">加载字段</button>
+    </div>
+    <div class="msg" id="btFieldsMsg"></div>
+    <div id="btFieldsArea" class="hidden">
+      <label style="margin-top:12px;">① 链接所在字段（含图片 URL 的文本 / 网址字段）</label>
+      <select id="btLinkField" style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;"></select>
+      <label style="margin-top:12px;">② 写入附件的字段（附件类型）</label>
+      <select id="btAttachField" style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;"></select>
+      <label style="margin-top:12px;display:flex;align-items:center;gap:8px;font-size:13px;color:var(--text);">
+        <input type="checkbox" id="btOverwrite" /> 覆盖已存在的附件（勾选＝对所有记录重转；不勾选＝只转换附件为空的记录）
+      </label>
+      <div class="row" style="margin-top:14px;">
+        <button id="btConvertBtn">开始转换</button>
+      </div>
+    </div>
+    <div class="tip">转换逻辑：逐条读取记录 → 从「链接字段」抽取图片 URL → 下载并上传到多维表格 → 写回「附件字段」。链接字段含多个 URL 时，每个生成一个独立附件。建议先小范围验证再全量。</div>
   </div>
 
   <!-- 步骤 2：选择子表 + 扫描 -->
@@ -154,8 +178,9 @@
 
 <script>
 const $ = (id) => document.getElementById(id);
-let RESOLVED = null;     // { title, sheets:[...] }
+let RESOLVED = null;     // { kind, title, sheets:[...] } 或 { kind:'bitable', appToken, tables:[...] }
 let SCAN = null;         // { total, cells:[...] }
+let BT_FIELDS = null;    // 多维表格字段列表 [{field_id, field_name, type}]
 let JOB_TIMER = null;
 
 function show(el){ el.classList.remove('hidden'); }
@@ -304,20 +329,83 @@ $('resolveBtn').onclick = async () => {
     const d = await r.json();
     if (!d.ok) { msg.className='msg err'; msg.textContent = d.error || '解析失败'; return; }
     RESOLVED = d;
-    const sel = $('sheetSelect'); sel.innerHTML = '';
-    d.sheets.forEach((s, i) => {
-      const o = document.createElement('option');
-      o.value = s.sheet_id;
-      o.textContent = `${s.sheet_name}（${s.row_count}行 × ${s.column_count}列）`;
-      sel.appendChild(o);
-    });
-    msg.className='msg ok';
-    msg.textContent = `解析成功：${d.sheets.length} 个子表` + (d.title ? ` · ${d.title}` : '');
-    show($('sheetCard'));
-    hide($('previewCard')); hide($('jobCard'));
+    if (d.kind === 'bitable') {
+      // 多维表格模式
+      msg.className='msg ok';
+      msg.textContent = `解析成功：多维表格「${d.title || ''}」，含 ${d.tables.length} 个数据表`;
+      const sel = $('btTable'); sel.innerHTML = '';
+      d.tables.forEach((t) => {
+        const o = document.createElement('option');
+        o.value = t.table_id;
+        o.textContent = t.name;
+        sel.appendChild(o);
+      });
+      show($('bitableCard'));
+      hide($('sheetCard')); hide($('previewCard')); hide($('jobCard'));
+    } else {
+      // 电子表格模式（原逻辑）
+      const sel = $('sheetSelect'); sel.innerHTML = '';
+      d.sheets.forEach((s, i) => {
+        const o = document.createElement('option');
+        o.value = s.sheet_id;
+        o.textContent = `${s.sheet_name}（${s.row_count}行 × ${s.column_count}列）`;
+        sel.appendChild(o);
+      });
+      msg.className='msg ok';
+      msg.textContent = `解析成功：${d.sheets.length} 个子表` + (d.title ? ` · ${d.title}` : '');
+      show($('sheetCard'));
+      hide($('previewCard')); hide($('jobCard'));
+    }
   } catch(e) {
     msg.className='msg err'; msg.textContent = '请求失败：' + e.message;
   }
+};
+
+// 多维表格：加载字段
+$('btLoadFields').onclick = async () => {
+  const appToken = RESOLVED.appToken;
+  const tableId = $('btTable').value;
+  const msg = $('btFieldsMsg');
+  msg.className='msg'; msg.textContent='加载字段中…';
+  try {
+    const r = await apiFetch('/api/bitable/fields', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({appToken, tableId})});
+    const d = await r.json();
+    if (!d.ok) { msg.className='msg err'; msg.textContent = d.error || '获取字段失败'; return; }
+    BT_FIELDS = d.fields;
+    const lf = $('btLinkField'); lf.innerHTML='';
+    const af = $('btAttachField'); af.innerHTML='';
+    d.fields.forEach((f) => {
+      const o1 = document.createElement('option');
+      o1.value = f.field_name; o1.textContent = f.field_name + '（类型' + f.type + '）';
+      lf.appendChild(o1);
+      const o2 = document.createElement('option');
+      o2.value = f.field_name; o2.textContent = f.field_name;
+      af.appendChild(o2);
+    });
+    // 预选附件字段（type 17 = 附件）
+    const attachIdx = d.fields.findIndex((f) => f.type === 17);
+    if (attachIdx >= 0) af.selectedIndex = attachIdx;
+    msg.className='msg ok'; msg.textContent = `已加载 ${d.fields.length} 个字段` + (attachIdx >= 0 ? '（已自动预选附件字段）' : '');
+    show($('btFieldsArea'));
+  } catch(e) { msg.className='msg err'; msg.textContent='请求失败：'+e.message; }
+};
+
+// 多维表格：开始转换
+$('btConvertBtn').onclick = async () => {
+  const appToken = RESOLVED.appToken;
+  const tableId = $('btTable').value;
+  const linkField = $('btLinkField').value;
+  const attachField = $('btAttachField').value;
+  const overwrite = $('btOverwrite').checked;
+  if (!linkField || !attachField) { alert('请先加载并选择字段'); return; }
+  if (!confirm(`确认将「${linkField}」的图片链接转换写入「${attachField}」附件？\n${overwrite ? '（覆盖模式：全部重转）' : '（仅转换附件为空的记录）'}`)) return;
+  try {
+    const r = await apiFetch('/api/bitable/convert', {method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({appToken, tableId, linkField, attachField, overwrite})});
+    const d = await r.json();
+    if (!d.ok) { alert(d.error || '启动失败'); return; }
+    startPolling(d.jobId);
+  } catch(e) { alert('请求失败：'+e.message); }
 };
 
 $('scanBtn').onclick = async () => {
@@ -402,7 +490,7 @@ function startPolling(jobId) {
         const mergedCnt = d.results.filter(x=>x.merged).length;
         box.innerHTML = `<div class="stat" style="margin-bottom:6px;">成功 <b class="res-ok">${okCnt}</b> · 失败 <b class="res-fail">${failCnt}</b>` +
           (mergedCnt ? ` · 其中 <b>${mergedCnt}</b> 个单元格由多图拼成一张` : '') + `</div>` +
-          d.results.map(x => `<div class="stat">${x.range}${x.merged?` <span class="tag" style="background:#eafaf3;color:var(--ok);">拼${x.merged}张</span>`:''} — <span class="${x.status==='done'?'res-ok':(x.status==='skipped'?'res-ok':'res-fail')}">${x.status==='done'?'✓ 已转图片':(x.status==='skipped'?'⊘ '+(x.error||'跳过'):('✗ '+ (x.error||'失败')))}</span></div>`).join('');
+          d.results.map(x => `<div class="stat">${x.range || x.recordId || ''}${x.merged?` <span class="tag" style="background:#eafaf3;color:var(--ok);">${x.merged}个附件</span>`:''} — <span class="${x.status==='done'?'res-ok':(x.status==='skipped'?'res-ok':'res-fail')}">${x.status==='done'?'✓ 已写入附件':(x.status==='skipped'?'⊘ '+(x.error||'跳过'):('✗ '+ (x.error||'失败')))}</span></div>`).join('');
         stat.innerHTML += d.status==='finished' ? ' · <b class="res-ok">全部完成</b>' : ' · <b class="res-fail">存在失败</b>';
       }
     } catch(e) { /* ignore transient */ }

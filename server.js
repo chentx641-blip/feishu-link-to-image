@@ -17,6 +17,8 @@
  *   POST /api/resolve         -> 解析文档 -> {spreadsheetToken, sheets[]}
  *   POST /api/scan            -> 扫描某子表所有「图片链接」单元格
  *   POST /api/convert         -> 逐格下载图片并写入单元格；一格多图自动拼成一张网格图写回原单元格（不新增列）
+ *   POST /api/bitable/fields  -> 多维表格：列出某数据表字段（链接字段 / 附件字段下拉用）
+ *   POST /api/bitable/convert -> 多维表格：链接字段 → 附件字段（自动识别电子表格/多维表格链接）
  *   GET  /api/job/:id         -> 任务进度
  */
 
@@ -314,6 +316,23 @@ async function feishuCall(method, apiPath, { params = null, body = null, token =
   return json;
 }
 
+// 与 feishuCall 类似，但支持「二进制 body」（用于多维表格文件上传：Content-Type 设为具体 mime，
+// body 直接是图片二进制），不适用于 JSON 接口。
+async function feishuCallRaw(method, apiPath, { params = null, token = null, contentType = 'application/octet-stream', body = null } = {}) {
+  let url = 'https://open.feishu.cn' + apiPath;
+  if (params) {
+    const q = new URLSearchParams(params).toString();
+    url += (url.includes('?') ? '&' : '?') + q;
+  }
+  const headers = { 'Content-Type': contentType };
+  if (token) headers['Authorization'] = 'Bearer ' + token;
+  const resp = await fetch(url, { method, headers, body });
+  const text = await resp.text();
+  let json;
+  try { json = JSON.parse(text); } catch (e) { json = { raw: text }; }
+  return json;
+}
+
 async function getValidToken() {
   await bootstrapToken();
   if (!tokenStore || !tokenStore.access_token) {
@@ -337,33 +356,73 @@ function parseDocUrl(url) {
   // 直接电子表格链接：https://<domain>/sheets/<token>
   let m = url.match(/\/sheets\/([A-Za-z0-9]+)/);
   if (m) return { type: 'sheet', token: m[1] };
-  // wiki 链接：https://<domain>/wiki/<token>
+  // 直接多维表格链接：https://<domain>/base/<token>
+  m = url.match(/\/base\/([A-Za-z0-9]+)/);
+  if (m) return { type: 'bitable', token: m[1] };
+  // wiki 链接：https://<domain>/wiki/<token>（节点可能是电子表格，也可能是多维表格）
   m = url.match(/\/wiki\/([A-Za-z0-9]+)/);
   if (m) return { type: 'wiki', token: m[1] };
   return null;
 }
 
+// 解析多维表格节点：拿到 app_token 后列出其下的数据表
+async function resolveBitableNode(appToken, node) {
+  if (!appToken) throw new Error('无法从节点获取多维表格 token：' + JSON.stringify(node || {}).slice(0, 200));
+  const token = await getValidToken();
+  const r = await feishuCall('GET', '/open-apis/bitable/v1/apps/' + appToken + '/tables', { token });
+  if (r.code !== 0) throw new Error('获取多维表格数据表失败：' + (r.msg || JSON.stringify(r).slice(0, 200)));
+  const tables = (r.data && r.data.items || []).map((t) => ({
+    table_id: t.table_id,
+    name: t.name || t.table_id,
+  }));
+  return { kind: 'bitable', title: (node && node.title) || '', appToken, tables };
+}
+
 async function resolveDoc(url) {
   const parsed = parseDocUrl(url);
-  if (!parsed) throw new Error('无法识别的飞书链接（应为 /sheets/ 或 /wiki/ 链接）');
-  let spreadsheetToken = parsed.token;
-  if (parsed.type === 'wiki') {
-    const token = await getValidToken();
-    const r = await feishuCall('GET', '/open-apis/wiki/v2/spaces/get_node', {
-      params: { token: parsed.token, obj_type: 'wiki' },
-      token,
-    });
-    if (r.code !== 0) throw new Error('wiki 解析失败：' + (r.msg || JSON.stringify(r).slice(0, 200)));
-    const node = (r.data && r.data.node) || {};
-    if (node.obj_type && node.obj_type !== 'sheet') {
-      throw new Error('该 wiki 节点类型是「' + node.obj_type + '」，不是电子表格，暂不支持。');
-    }
-    spreadsheetToken = node.obj_token || node.spreadsheet_token || node.node_token;
-    if (!spreadsheetToken) throw new Error('无法从 wiki 节点获取电子表格 token：' + JSON.stringify(r.data).slice(0, 200));
+  if (!parsed) throw new Error('无法识别的飞书链接（应为 /sheets/、/wiki/ 或 /base/ 链接）');
+
+  // 直接多维表格链接
+  if (parsed.type === 'bitable') {
+    return await resolveBitableNode(parsed.token, null);
   }
-  // 列出工作表
+
+  // 直接电子表格链接
+  if (parsed.type === 'sheet') {
+    const spreadsheetToken = parsed.token;
+    const token = await getValidToken();
+    const q = await feishuCall('GET', '/open-apis/sheets/v3/spreadsheets/' + spreadsheetToken + '/sheets/query', { token });
+    if (q.code !== 0) throw new Error('获取工作表失败：' + (q.msg || JSON.stringify(q).slice(0, 200)));
+    const sheets = (q.data && q.data.sheets || []).map((s) => ({
+      sheet_id: s.sheet_id,
+      sheet_name: s.title || s.sheet_name || s.sheet_id,
+      row_count: (s.grid_properties && s.grid_properties.row_count) || 200,
+      column_count: (s.grid_properties && s.grid_properties.column_count) || 25,
+    }));
+    return { kind: 'sheet', title: '', spreadsheetToken, sheets };
+  }
+
+  // wiki 链接：可能是电子表格，也可能是多维表格
   const token = await getValidToken();
-  const q = await feishuCall('GET', '/open-apis/sheets/v3/spreadsheets/' + spreadsheetToken + '/sheets/query', { token });
+  const r = await feishuCall('GET', '/open-apis/wiki/v2/spaces/get_node', {
+    params: { token: parsed.token, obj_type: 'wiki' },
+    token,
+  });
+  if (r.code !== 0) throw new Error('wiki 解析失败：' + (r.msg || JSON.stringify(r).slice(0, 200)));
+  const node = (r.data && r.data.node) || {};
+  const objType = node.obj_type;
+  const objToken = node.obj_token || node.spreadsheet_token || node.node_token;
+
+  if (objType === 'bitable') {
+    // 多维表格：node_token 即 app_token
+    return await resolveBitableNode(objToken, node);
+  }
+  if (objType && objType !== 'sheet') {
+    throw new Error('该 wiki 节点类型是「' + objType + '」，暂不支持（当前工具支持电子表格与多维表格）。');
+  }
+  // 电子表格
+  if (!objToken) throw new Error('无法从 wiki 节点获取电子表格 token：' + JSON.stringify(r.data).slice(0, 200));
+  const q = await feishuCall('GET', '/open-apis/sheets/v3/spreadsheets/' + objToken + '/sheets/query', { token });
   if (q.code !== 0) throw new Error('获取工作表失败：' + (q.msg || JSON.stringify(q).slice(0, 200)));
   const sheets = (q.data && q.data.sheets || []).map((s) => ({
     sheet_id: s.sheet_id,
@@ -371,7 +430,7 @@ async function resolveDoc(url) {
     row_count: (s.grid_properties && s.grid_properties.row_count) || 200,
     column_count: (s.grid_properties && s.grid_properties.column_count) || 25,
   }));
-  return { title: '', spreadsheetToken, sheets };
+  return { kind: 'sheet', title: node.title || '', spreadsheetToken: objToken, sheets };
 }
 
 // ---------------------------------------------------------------------------
@@ -828,6 +887,99 @@ async function composeImages(buffers) {
 }
 
 // ---------------------------------------------------------------------------
+// 多维表格（Bitable）支持：链接字段 → 附件字段
+// 关键区别：Bitable 的附件字段不能直接填 URL，必须先把图片上传到多维表格拿到
+// file_token，再写入附件字段数组。因此流程是：下载图片 → 上传拿 file_token → 写回。
+// ---------------------------------------------------------------------------
+
+// 把图片二进制上传到多维表格，返回 file_token
+async function uploadBitableFile(appToken, buf, name, token) {
+  const ext = (String(name).split('.').pop() || 'jpg').toLowerCase();
+  const mime = ({ jpg: 'image/jpeg', jpeg: 'image/jpeg', png: 'image/png', webp: 'image/webp', gif: 'image/gif', bmp: 'image/bmp' })[ext] || 'application/octet-stream';
+  const r = await feishuCallRaw('POST', '/open-apis/bitable/v1/apps/' + appToken + '/files?name=' + encodeURIComponent(name), {
+    token, contentType: mime, body: buf,
+  });
+  if (r.code !== 0 || !r.data || !r.data.file_token) {
+    throw new Error('多维表格文件上传失败: ' + (r.msg || JSON.stringify(r).slice(0, 200)));
+  }
+  return r.data.file_token;
+}
+
+// 列出多维表格某数据表的字段（用于前端下拉选择链接字段 / 附件字段）
+async function listBitableFields(appToken, tableId) {
+  const token = await getValidToken();
+  const r = await feishuCall('GET', '/open-apis/bitable/v1/apps/' + appToken + '/tables/' + tableId + '/fields', { token });
+  if (r.code !== 0) throw new Error('获取字段失败：' + (r.msg || JSON.stringify(r).slice(0, 200)));
+  return (r.data && r.data.items || []).map((f) => ({ field_id: f.field_id, field_name: f.field_name, type: f.type }));
+}
+
+// 多维表格「链接 → 附件」异步任务
+async function startBitableJob(appToken, tableId, linkField, attachField, overwrite) {
+  const id = String(seq++);
+  const job = { id, status: 'running', total: 0, done: 0, results: [], startedAt: Date.now() };
+  jobs.set(id, job);
+  (async () => {
+    try {
+      const token = await getValidToken();
+      // 1) 拉取全部记录（分页）
+      const records = [];
+      let pageToken = '';
+      do {
+        const qs = '/open-apis/bitable/v1/apps/' + appToken + '/tables/' + tableId + '/records?page_size=500' +
+          (pageToken ? '&page_token=' + encodeURIComponent(pageToken) : '');
+        const r = await feishuCall('GET', qs, { token });
+        if (r.code !== 0) throw new Error('读取记录失败：' + (r.msg || JSON.stringify(r).slice(0, 200)));
+        const items = (r.data && r.data.items) || [];
+        records.push(...items);
+        pageToken = (r.data && r.data.has_more) ? r.data.page_token : '';
+      } while (pageToken);
+      job.total = records.length;
+
+      // 2) 逐条处理
+      for (const rec of records) {
+        const rid = rec.record_id;
+        const fields = rec.fields || {};
+        const linkVal = fields[linkField];
+        const attachVal = fields[attachField];
+        const attachEmpty = !attachVal || (Array.isArray(attachVal) && attachVal.length === 0);
+        const linkText = (typeof linkVal === 'string') ? linkVal : (linkVal == null ? '' : String(linkVal));
+        const urls = extractUrlsFromCell(linkText);
+        const result = { recordId: rid, status: 'pending', merged: 0, error: '' };
+        if (urls.length === 0) {
+          result.status = 'skipped'; result.error = '链接字段无图片链接';
+        } else if (!overwrite && !attachEmpty) {
+          result.status = 'skipped'; result.error = '附件已存在（未勾选覆盖）';
+        } else {
+          try {
+            const fileTokens = [];
+            for (const u of urls) {
+              const buf = await downloadImage(u);
+              const ext = guessExt(u);
+              const ft = await uploadBitableFile(appToken, buf, 'img' + ext, token);
+              fileTokens.push({ file_token: ft });
+            }
+            // 写入附件字段（覆盖式：直接以新附件数组替换）
+            const ur = await feishuCall('PUT', '/open-apis/bitable/v1/apps/' + appToken + '/tables/' + tableId + '/records/' + rid, {
+              token, body: { fields: { [attachField]: fileTokens } },
+            });
+            if (ur.code !== 0) throw new Error('写入附件失败: ' + (ur.msg || JSON.stringify(ur).slice(0, 200)));
+            result.status = 'done'; result.merged = fileTokens.length;
+          } catch (e) {
+            result.status = 'failed'; result.error = e.message;
+          }
+        }
+        job.results.push(result);
+        job.done++;
+      }
+      job.status = 'finished';
+    } catch (e) {
+      job.status = 'error'; job.error = e.message;
+    }
+  })();
+  return job;
+}
+
+// ---------------------------------------------------------------------------
 // 转换：逐格下载图片并写入单元格（异步任务）
 // ---------------------------------------------------------------------------
 const jobs = new Map();
@@ -950,8 +1102,8 @@ const server = http.createServer(async (req, res) => {
         tokenReady: !!(tokenStore && tokenStore.access_token),
         sharpReady: (() => { try { getSharp(); return true; } catch (e) { return false; } })(),
         sharpError: (() => { try { getSharp(); return null; } catch (e) { return String(e && e.message || e); } })(),
-        version: '2.6',
-        build: '2026-09-02-sharp-lanczos-compose',
+        version: '2.7',
+        build: '2026-09-06-bitable-support',
       });
     }
 
@@ -963,7 +1115,7 @@ const server = http.createServer(async (req, res) => {
       }
       oauthState = crypto.randomBytes(12).toString('hex');
       const redirectUri = PUBLIC_BASE.replace(/\/$/, '') + '/api/oauth/callback';
-      const scope = 'sheets:spreadsheet wiki:wiki offline_access';
+      const scope = 'sheets:spreadsheet wiki:wiki bitable:app offline_access';
       const authUrl = 'https://accounts.feishu.cn/open-apis/authen/v1/authorize?' +
         new URLSearchParams({
           client_id: FEISHU_APP_ID,
@@ -1041,7 +1193,11 @@ const server = http.createServer(async (req, res) => {
       if (!url) return sendJSON(res, 400, { ok: false, error: '缺少文档链接' });
       try {
         const result = await resolveDoc(url);
-        return sendJSON(res, 200, { ok: true, title: result.title, spreadsheetToken: result.spreadsheetToken, sheets: result.sheets });
+        return sendJSON(res, 200, {
+          ok: true, kind: result.kind, title: result.title,
+          spreadsheetToken: result.spreadsheetToken, sheets: result.sheets,
+          appToken: result.appToken, tables: result.tables,
+        });
       } catch (e) {
         return sendJSON(res, 200, { ok: false, error: '解析失败：' + String(e.message || e).slice(0, 400) });
       }
@@ -1090,6 +1246,41 @@ const server = http.createServer(async (req, res) => {
     }
 
     // （拼图方案下不再需要「插入列补救」接口；多图已在转换时自动拼合写回原单元格。）
+
+    // ---- 多维表格：列出字段（链接字段 / 附件字段下拉用）----
+    if (req.method === 'POST' && urlp === '/api/bitable/fields') {
+      const body = await readBody(req);
+      if (!gateOK(req, res, body)) return;
+      const appToken = body.appToken;
+      const tableId = body.tableId;
+      if (!appToken || !tableId) return sendJSON(res, 400, { ok: false, error: '缺少 appToken 或 tableId' });
+      try {
+        const fields = await listBitableFields(appToken, tableId);
+        return sendJSON(res, 200, { ok: true, fields });
+      } catch (e) {
+        return sendJSON(res, 200, { ok: false, error: '获取字段失败：' + String(e.message || e).slice(0, 400) });
+      }
+    }
+
+    // ---- 多维表格：链接字段 → 附件字段 转换（异步任务）----
+    if (req.method === 'POST' && urlp === '/api/bitable/convert') {
+      const body = await readBody(req);
+      if (!gateOK(req, res, body)) return;
+      const appToken = body.appToken;
+      const tableId = body.tableId;
+      const linkField = body.linkField;
+      const attachField = body.attachField;
+      const overwrite = !!body.overwrite;
+      if (!appToken || !tableId || !linkField || !attachField) {
+        return sendJSON(res, 400, { ok: false, error: '缺少参数（appToken / tableId / linkField / attachField）' });
+      }
+      try {
+        const job = await startBitableJob(appToken, tableId, linkField, attachField, overwrite);
+        return sendJSON(res, 200, { ok: true, jobId: job.id, total: job.total });
+      } catch (e) {
+        return sendJSON(res, 200, { ok: false, error: '启动转换失败：' + String(e.message || e).slice(0, 400) });
+      }
+    }
 
     if (req.method === 'GET' && urlp.startsWith('/api/job/')) {
       if (!gateOK(req, res, null)) return;
