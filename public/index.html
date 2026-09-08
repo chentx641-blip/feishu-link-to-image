@@ -150,7 +150,7 @@
   <!-- 步骤 3：预览 + 确认转换 -->
   <div class="card hidden" id="previewCard">
     <div class="row" style="justify-content:space-between;align-items:center;">
-      <div><b id="scanCount">0</b> 个图片链接单元格待转换<span class="count-badge" id="sheetNameBadge"></span></div>
+      <div><b id="scanCount">0</b> 个图片单元格<span class="count-badge" id="sheetNameBadge"></span><span class="count-badge" id="srcBadge"></span></div>
       <label style="margin:0;"><input type="checkbox" id="selectAll" checked /> 全选</label>
     </div>
     <div style="max-height:320px;overflow:auto;margin-top:8px;">
@@ -168,6 +168,7 @@
           <thead><tr><th style="width:90px;">截图列</th><th style="width:150px;">识别类型</th><th>写入列</th></tr></thead>
           <tbody id="vlCfgBody"></tbody>
         </table>
+        <label style="margin-top:10px;display:block;"><input type="checkbox" id="skipFilled" checked /> 跳过已提取的行（目标列任一列已有值就不重复识别）</label>
         <div class="row" style="margin-top:10px;">
           <button class="ghost" id="extractBtn">开始智能识别</button>
           <span class="stat" id="vlStat"></span>
@@ -467,15 +468,24 @@ $('scanBtn').onclick = async () => {
 function renderPreview(d) {
   $('scanCount').textContent = d.total;
   $('sheetNameBadge').textContent = $('sheetSelect').value;
+  const srcLabel = { link: '图片链接', embed: '内嵌图片', both: '链接+内嵌' }[d.imageSource || 'link'];
+  $('srcBadge').textContent = srcLabel;
+  // 内嵌图片无需「转换」，隐藏转换按钮，只保留识别
+  if (d.imageSource === 'embed') { hide($('convertBtn')); } else { show($('convertBtn')); }
   const tb = $('cellTable'); tb.innerHTML = '';
   d.cells.forEach((c, i) => {
     const tr = document.createElement('tr');
     const multi = (c.imageCount > 1) ? ` <span class="tag" style="background:#eafaf3;color:var(--ok);">拼${c.imageCount}张</span>` : '';
+    const isEmbed = c.source === 'embed';
+    const tagHtml = isEmbed
+      ? `<span class="tag" style="background:#eef4ff;color:#2b5cd9;">内嵌图片</span>`
+      : `<span class="tag text">图片链接</span>`;
+    const detail = isEmbed ? (c.imageToken || '') : (c.url || '');
     tr.innerHTML = `
       <td><input type="checkbox" class="cellchk" data-i="${i}" checked /></td>
       <td class="range">${c.range}</td>
-      <td><span class="tag ${c.source}">图片链接</span>${multi}</td>
-      <td class="url-cell" title="${c.url}">${c.url}</td>`;
+      <td>${tagHtml}${multi}</td>
+      <td class="url-cell" title="${detail}">${detail}</td>`;
     tb.appendChild(tr);
   });
   $('selectAll').checked = true;
@@ -605,20 +615,33 @@ $('extractBtn').onclick = async () => {
   if (chosen.length === 0) { alert('请至少选择一个单元格'); return; }
   try {
     $('vlStat').textContent = '识别中…';
+    const sheet = RESOLVED.sheets.find(s => s.sheet_id === $('sheetSelect').value);
     const r = await apiFetch('/api/extract', {
       method: 'POST', headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ cells: chosen, mapping, concurrency: 5 }),
+      body: JSON.stringify({
+        cells: chosen, mapping, concurrency: 5,
+        skipFilled: $('skipFilled') ? $('skipFilled').checked : true,
+        spreadsheetToken: RESOLVED.spreadsheetToken,
+        sheetId: $('sheetSelect').value,
+        rowCount: (sheet && sheet.row_count) || 0,
+      }),
     });
     const d = await r.json();
-    if (!d.ok) { alert(d.error || '识别启动失败'); $('vlStat').textContent = ''; return; }
-    startExtractPolling(d.jobId);
+    if (!d.ok) {
+      let tip = d.error || '识别启动失败';
+      if (d.skippedCount) tip += `\n（已跳过 ${d.skippedCount} 个已有值的单元格）`;
+      alert(tip); $('vlStat').textContent = ''; return;
+    }
+    if (d.skippedCount) $('vlStat').textContent = `已跳过 ${d.skippedCount} 个已有值的单元格`;
+    startExtractPolling(d.jobId, d.skippedCount || 0);
   } catch (e) { alert('请求失败：' + e.message); $('vlStat').textContent = ''; }
 };
 
-function startExtractPolling(jobId) {
+function startExtractPolling(jobId, skippedCount) {
   hide($('previewCard'));
   show($('extractCard'));
-  $('extractSummary').textContent = '识别中…（每张约 2 秒，5 路并发）';
+  $('extractSummary').textContent = '识别中…（每张约 2 秒，5 路并发）'
+    + (skippedCount ? `，已跳过 ${skippedCount} 个已有值的单元格` : '');
   $('extractTable').innerHTML = '';
   if (JOB_TIMER) clearInterval(JOB_TIMER);
   JOB_TIMER = setInterval(async () => {

@@ -478,6 +478,102 @@ async function readSheetGrid(token, spreadsheetToken, sheetId, rowCount, columnC
   return grid;
 }
 
+// ---------------------------------------------------------------------------
+// 单元格内嵌图片（embed-image）读取
+// 关键：默认的 valueRenderOption=ToString 只返回 [{"id":207,"type":"embed-image"}]，
+// 拿不到图片标识；必须改用 Formula（或 UnformattedValue / FormattedValue），返回体
+// 才带 fileToken：{"type":"embed-image","fileToken":"SHF2b...","width":1220,"height":2656}
+// 拿到 fileToken 后再走 /open-apis/drive/v1/medias/{fileToken}/download 取图片二进制。
+// ---------------------------------------------------------------------------
+async function readSheetGridFormula(token, spreadsheetToken, sheetId, rowCount, columnCount) {
+  const COL_CHUNK = 100;
+  const ROW_CHUNK = 1000;
+  const grid = new Map(); // "row,col" -> 原始值（string / object / array）
+  for (let rStart = 1; rStart <= rowCount; rStart += ROW_CHUNK) {
+    const rEnd = Math.min(rStart + ROW_CHUNK - 1, rowCount);
+    for (let cStart = 1; cStart <= columnCount; cStart += COL_CHUNK) {
+      const cEnd = Math.min(cStart + COL_CHUNK - 1, columnCount);
+      const range = `${sheetId}!${colLetter(cStart)}${rStart}:${colLetter(cEnd)}${rEnd}`;
+      const r = await feishuCall('GET',
+        '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values/' + range,
+        { params: { valueRenderOption: 'Formula' }, token });
+      if (r.code !== 0) throw new Error('读取单元格失败：' + (r.msg || JSON.stringify(r).slice(0, 200)));
+      const values = (r.data && r.data.valueRange && r.data.valueRange.values) || [];
+      for (let i = 0; i < values.length; i++) {
+        const rowArr = values[i];
+        const absRow = rStart + i;
+        for (let j = 0; j < rowArr.length; j++) {
+          const v = rowArr[j];
+          if (v === '' || v == null) continue;
+          grid.set(absRow + ',' + (cStart + j), v);
+        }
+      }
+    }
+  }
+  return grid;
+}
+
+// 递归遍历单元格原始值，收集所有内嵌图片的 fileToken
+// （Formula 模式下单元格可能是单个对象、也可能是富文本元素数组，两种都要兼容）
+function collectEmbedTokens(v) {
+  const out = [];
+  const seen = new Set();
+  const walk = (x) => {
+    if (x == null) return;
+    if (Array.isArray(x)) { x.forEach(walk); return; }
+    if (typeof x === 'object') {
+      if (x.type === 'embed-image' && x.fileToken && !seen.has(x.fileToken)) {
+        seen.add(x.fileToken);
+        out.push({ fileToken: x.fileToken, width: x.width || 0, height: x.height || 0 });
+      }
+      return;
+    }
+  };
+  walk(v);
+  return out;
+}
+
+// 把单元格原始值转成纯文本（用于从文本/公式里抽图片链接）
+function cellToText(v) {
+  if (v == null) return '';
+  if (typeof v === 'string') return v;
+  if (Array.isArray(v)) return v.map((x) => (x && typeof x === 'object' ? String(x.text || '') : String(x == null ? '' : x))).join('');
+  if (typeof v === 'object') return String(v.text || '');
+  return String(v);
+}
+
+// 下载单元格内嵌图片（fileToken -> 二进制）
+async function downloadEmbedImage(token, fileToken) {
+  const url = 'https://open.feishu.cn/open-apis/drive/v1/medias/' + encodeURIComponent(fileToken) + '/download';
+  const resp = await fetch(url, { headers: { Authorization: 'Bearer ' + token } });
+  const buf = Buffer.from(await resp.arrayBuffer());
+  const ct = String(resp.headers.get('content-type') || '');
+  if (!resp.ok || ct.includes('application/json')) {
+    let msg = '';
+    try { msg = (JSON.parse(buf.toString('utf8')) || {}).msg || ''; } catch (e) { /* 非 JSON 忽略 */ }
+    throw new Error('内嵌图片下载失败' + (msg ? '：' + msg : '（HTTP ' + resp.status + '）'));
+  }
+  return buf;
+}
+
+// 读取若干整列的文本值，用于判断「目标列是否已有值」（跳过已提取的行）
+async function readColumnTexts(token, spreadsheetToken, sheetId, cols, rowCount) {
+  const out = new Map(); // "列名,行号" -> 文本
+  for (const col of cols) {
+    const range = `${sheetId}!${col}1:${col}${rowCount}`;
+    const r = await feishuCall('GET',
+      '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values/' + range,
+      { params: { valueRenderOption: 'ToString' }, token });
+    if (r.code !== 0) continue;
+    const values = (r.data && r.data.valueRange && r.data.valueRange.values) || [];
+    for (let i = 0; i < values.length; i++) {
+      const s = String(cellToText(values[i] && values[i][0]) || '').trim();
+      if (s) out.set(col + ',' + (i + 1), s);
+    }
+  }
+  return out;
+}
+
 // 从一个单元格文本中抽出所有 http(s) URL（按常见分隔符切分：全角/半角逗号、分号、空白、
 // 换行、引号、括号）。单元格可能是富文本——多个 =HYPERLINK 用「、/，」连在一起——必须拆开
 // 逐个处理，否则整串当作一个 URL 发给 OSS，会让 Signature 被污染而报 SignatureDoesNotMatch。
@@ -510,21 +606,46 @@ async function recoverCellUrl(token, spreadsheetToken, sheetId, addr) {
   return null;
 }
 
-async function scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnCount) {
+async function scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnCount, imageSource = 'link') {
   const token = await getValidToken();
-  const grid = await readSheetGrid(token, spreadsheetToken, sheetId, rowCount, columnCount);
+  const wantLink = imageSource === 'link' || imageSource === 'both';
+  const wantEmbed = imageSource === 'embed' || imageSource === 'both';
+  // 找内嵌图片必须用 Formula 渲染（ToString 只给 {"id":207,"type":"embed-image"}，没有 fileToken）。
+  // Formula 渲染同样能拿到纯文本与公式文本，所以「两者都要」时只读这一遍即可，不会多打 API。
+  const grid = wantEmbed
+    ? await readSheetGridFormula(token, spreadsheetToken, sheetId, rowCount, columnCount)
+    : await readSheetGrid(token, spreadsheetToken, sheetId, rowCount, columnCount);
   const cells = [];
   for (const [key, value] of grid.entries()) {
-    if (!value || typeof value !== 'string') continue;
-    // 1) 先从 ToString 文本里抽 URL（富文本多链接会被拆成多个）
-    let urls = extractUrlsFromCell(value).filter((u) => isImageUrl(u));
-    // 2) 仅当「单元格里明确含 http、但一层 ToString 没抽到任何可识别的 URL」时，
+    const [rowStr, colStr] = key.split(',');
+    const row = parseInt(rowStr, 10);
+    const col = parseInt(colStr, 10);
+    const addr = colLetter(col) + row;
+
+    // A) 单元格内嵌图片（人工粘贴的截图就是这种）
+    if (wantEmbed) {
+      const imgs = collectEmbedTokens(value);
+      if (imgs.length) {
+        cells.push({
+          sheetId, sheetName, range: addr, row, col, source: 'embed',
+          imageToken: imgs[0].fileToken, imageTokens: imgs.map((i) => i.fileToken),
+          imageCount: imgs.length, width: imgs[0].width, height: imgs[0].height,
+        });
+        continue;
+      }
+    }
+
+    // B) 单元格文本里的图片链接（问卷星 / 表单导出）
+    if (!wantLink) continue;
+    const text = cellToText(value).trim();
+    if (!text) continue;
+    // 1) 先从文本里抽 URL（富文本多链接会被拆成多个）
+    let urls = extractUrlsFromCell(text).filter((u) => isImageUrl(u));
+    // 2) 仅当「单元格里明确含 http、但一层没抽到任何可识别的 URL」时，
     //    才用 Formula/UnformattedValue 渲染兜底（典型场景：超链接公式 =HYPERLINK("url","文字")，
-    //    ToString 只返回显示文字）。若已经抽到 URL（即使未签名），无需走兜底，避免无关单元格
+    //    只返回显示文字）。若已经抽到 URL（即使未签名），无需走兜底，避免无关单元格
     //    每格狂打 2 次飞书 API 导致扫描极慢。
-    if (urls.length === 0 && /https?:\/\//.test(value)) {
-      const [rowStr0, colStr0] = key.split(',');
-      const addr = colLetter(parseInt(colStr0, 10)) + rowStr0;
+    if (urls.length === 0 && /https?:\/\//.test(text)) {
       const recovered = await recoverCellUrl(token, spreadsheetToken, sheetId, addr);
       if (recovered) {
         const ru = extractUrlsFromCell(recovered).filter((u) => isImageUrl(u));
@@ -534,10 +655,6 @@ async function scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnC
     if (urls.length === 0) continue;
     // 同一单元格内去重，避免重复链接被拼两次
     const uniq = [...new Set(urls)];
-    const [rowStr, colStr] = key.split(',');
-    const row = parseInt(rowStr, 10);
-    const col = parseInt(colStr, 10);
-    const addr = colLetter(col) + row;
     // 一格一图：直接写回原单元格；一格多图：把所有图拼成一张网格图写回原单元格
     // （不新增列、不改表结构，彻底避免「插入列打乱整表顺序」的问题）
     cells.push({ sheetId, sheetName, range: addr, row, col, urls: uniq, url: uniq[0], source: 'text', imageCount: uniq.length });
@@ -1159,17 +1276,21 @@ function startExtractJob(cells, mapping, concurrency) {
   jobs.set(id, job);
   (async () => {
     try {
+      const token = await getValidToken();
       const limit = Math.max(1, Math.min(10, concurrency || 5));
       await mapLimit(cells, limit, async (c) => {
         const colName = String(c.range || '').replace(/[0-9]/g, '');
         const cfg = mapping && mapping[colName];
-        const r = { range: c.range, row: c.row, col: colName, status: 'pending', type: (cfg && cfg.type) || null };
+        const r = { range: c.range, row: c.row, col: colName, status: 'pending', type: (cfg && cfg.type) || null, source: c.source || 'text' };
         try {
           if (!cfg || !cfg.type || !EXTRACT_TYPES[cfg.type]) {
             r.status = 'skipped';
             r.reason = '该列未配置识别';
           } else {
-            const buf = await downloadImage(c.url || (c.urls && c.urls[0]));
+            // 内嵌图走 fileToken 下载，链接图走外链下载
+            const buf = c.imageToken
+              ? await downloadEmbedImage(token, c.imageToken)
+              : await downloadImage(c.url || (c.urls && c.urls[0]));
             const data = await recognizeImage(buf, cfg.type);
             r.status = 'done';
             r.values = data;
@@ -1434,14 +1555,16 @@ const server = http.createServer(async (req, res) => {
         // 注意：AE/AF/AG 等截图列通常已超出早期 25 列上限，故兜底列数取 100。
         const rowCount = size.row_count || 1000;
         const columnCount = size.column_count || 100;
-        const cells = await scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnCount);
+        const imageSource = body.imageSource || 'link'; // link | embed | both
+        const cells = await scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnCount, imageSource);
         const mergedCount = cells.filter((c) => c.imageCount > 1).length;
+        const embedCount = cells.filter((c) => c.source === 'embed').length;
         // 诊断信息：若命中为 0，前端/日志可据此判断是否权限或范围问题，而非静默无链接。
-        console.log('[scan] sheet=' + sheetId + ' range=' + rowCount + 'x' + columnCount + ' 命中图链单元格=' + cells.length);
+        console.log('[scan] sheet=' + sheetId + ' range=' + rowCount + 'x' + columnCount + ' source=' + imageSource + ' 命中单元格=' + cells.length + '（内嵌图 ' + embedCount + '）');
         if (cells.length === 0) {
-          console.log('[scan] 未命中任何图链：请检查 operator 令牌是否有 sheets:spreadsheet:read 权限，以及目标列是否确为图片链接文本。');
+          console.log('[scan] 未命中：请检查 operator 令牌是否有 sheets:spreadsheet:read 权限；若图片是「单元格内嵌图」请把图片来源切成「内嵌图片」或「两者都要」。');
         }
-        return sendJSON(res, 200, { ok: true, total: cells.length, cells, mergedCount, row_count: rowCount, column_count: columnCount });
+        return sendJSON(res, 200, { ok: true, total: cells.length, cells, mergedCount, embedCount, imageSource, row_count: rowCount, column_count: columnCount });
       } catch (e) {
         return sendJSON(res, 200, { ok: false, error: '扫描失败：' + String(e.message || e).slice(0, 600) });
       }
@@ -1469,13 +1592,43 @@ const server = http.createServer(async (req, res) => {
       const mapping = body.mapping || {};
       if (cells.length === 0) return sendJSON(res, 400, { ok: false, error: '待识别列表为空' });
       if (!DASHSCOPE_API_KEY) return sendJSON(res, 200, { ok: false, error: '服务端未配置 DASHSCOPE_API_KEY 环境变量' });
-      const targets = cells.filter((c) => {
+      let targets = cells.filter((c) => {
         const colName = String(c.range || '').replace(/[0-9]/g, '');
         return mapping[colName] && mapping[colName].type;
       });
       if (targets.length === 0) return sendJSON(res, 200, { ok: false, error: '没有任何列配置了识别类型' });
+
+      // 跳过「已提取过」的行：目标列中任一列已有值就跳过（默认开启，避免分批次重复提取 / 覆盖人工录入）
+      const skipped = [];
+      if (body.skipFilled !== false && body.spreadsheetToken && body.sheetId) {
+        try {
+          const tk = await getValidToken();
+          const colOf = (c) => String(c.range || '').replace(/[0-9]/g, '');
+          const needCols = new Set();
+          for (const c of targets) {
+            const t = (mapping[colOf(c)] || {}).targets || {};
+            for (const k of Object.keys(t)) if (t[k]) needCols.add(String(t[k]).toUpperCase());
+          }
+          const maxRow = Math.max.apply(null, targets.map((c) => c.row || 0).concat([0]));
+          const texts = await readColumnTexts(tk, body.spreadsheetToken, body.sheetId, [...needCols], maxRow + 1);
+          const kept = [];
+          for (const c of targets) {
+            const t = (mapping[colOf(c)] || {}).targets || {};
+            const tcols = Object.keys(t).map((k) => String(t[k] || '').toUpperCase()).filter(Boolean);
+            const filled = tcols.filter((tc) => texts.has(tc + ',' + c.row));
+            if (filled.length) { skipped.push({ range: c.range, row: c.row, filledCols: filled }); continue; }
+            kept.push(c);
+          }
+          targets = kept;
+        } catch (e) {
+          console.log('[extract] 跳过已提取检测失败（不阻断识别）：' + String(e.message || e).slice(0, 200));
+        }
+      }
+      if (targets.length === 0) {
+        return sendJSON(res, 200, { ok: false, error: '所有目标行都已有值，没有需要识别的（如需重跑请关闭「跳过已提取」）', skippedCount: skipped.length, skipped });
+      }
       const job = startExtractJob(targets, mapping, body.concurrency || 5);
-      return sendJSON(res, 200, { ok: true, jobId: job.id, total: job.total, model: QWEN_VL_MODEL });
+      return sendJSON(res, 200, { ok: true, jobId: job.id, total: job.total, model: QWEN_VL_MODEL, skippedCount: skipped.length, skipped });
     }
 
     // ---- 智能识别：把确认过的结果写入表格（写入前设文本格式，写完立刻回读校验）----
@@ -1567,4 +1720,5 @@ if (require.main === module) {
 module.exports = {
   recognizeImage, buildPrompt, parseModelJSON, mapLimit,
   buildRanges, applyValues, startExtractJob, EXTRACT_TYPES,
+  scanSheet, downloadEmbedImage, readColumnTexts, collectEmbedTokens, cellToText, getValidToken,
 };
