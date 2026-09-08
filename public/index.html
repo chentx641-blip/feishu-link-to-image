@@ -142,8 +142,14 @@
     <label>选择子表</label>
     <div class="row">
       <select id="sheetSelect" style="padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;min-width:200px;"></select>
-      <button id="scanBtn">扫描图片链接</button>
+      <select id="sourceSelect" style="padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;">
+        <option value="embed">单元格内嵌图片（人工粘贴的截图）</option>
+        <option value="link">图片链接文本（问卷星/表单导出）</option>
+        <option value="both">两者都要</option>
+      </select>
+      <button id="scanBtn">扫描图片</button>
     </div>
+    <div class="tip" style="margin-top:6px;">图片来源说明：截图是<b>直接粘贴进单元格</b>的选「单元格内嵌图片」；单元格里是<b>一串网址</b>的选「图片链接文本」。</div>
     <div class="msg" id="scanMsg"></div>
   </div>
 
@@ -450,14 +456,16 @@ $('scanBtn').onclick = async () => {
   msg.className='msg'; msg.textContent='扫描中（逐块读取整张表）…';
   try {
     const r = await apiFetch('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({spreadsheetToken: RESOLVED.spreadsheetToken, sheetId, sheetName: sheet.sheet_name, rowCount:sheet.row_count, columnCount:sheet.column_count})});
+      body: JSON.stringify({spreadsheetToken: RESOLVED.spreadsheetToken, sheetId, sheetName: sheet.sheet_name, rowCount:sheet.row_count, columnCount:sheet.column_count, imageSource: ($('sourceSelect') ? $('sourceSelect').value : 'link')})});
     const d = await r.json();
     if (!d.ok) { msg.className='msg err'; msg.textContent = d.error || '扫描失败'; return; }
     SCAN = d;
     renderPreview(d);
-    let note = `扫描完成，共发现 ${d.total} 个图片链接单元格`;
+    let note = `扫描完成，共发现 ${d.total} 个图片单元格`;
+    if (d.embedCount > 0) note += `（其中内嵌图片 ${d.embedCount} 个）`;
     if (d.mergedCount > 0) note += `，其中 ${d.mergedCount} 个含多张图、将自动拼成一张网格图放回原单元格`;
-    note += '。';
+    if (d.total === 0) note += '。若为 0，请把「图片来源」切换成另一种再试。';
+    else note += '。';
     msg.className='msg ok'; msg.textContent = note;
     show($('previewCard')); hide($('jobCard'));
   } catch(e) {
