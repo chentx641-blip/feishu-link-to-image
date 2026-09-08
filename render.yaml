@@ -22,3 +22,7 @@ services:
         sync: false
       - key: PUBLIC_BASE
         sync: false
+      - key: DASHSCOPE_API_KEY
+        sync: false
+      - key: QWEN_VL_MODEL
+        value: qwen-vl-max

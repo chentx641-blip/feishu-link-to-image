@@ -159,6 +159,21 @@
         <tbody id="cellTable"></tbody>
       </table>
     </div>
+    <div id="vlBox" style="margin-top:14px;border:1px dashed var(--line);border-radius:8px;padding:12px;">
+      <label style="margin:0;"><input type="checkbox" id="enableExtract" /> 智能识别截图内容（AI 提取 UID / 小红书号 / 手机型号）</label>
+      <div id="vlOff" class="stat hidden" style="margin-top:6px;">服务端未配置视觉识别 Key，识别功能当前不可用。</div>
+      <div id="vlCfgWrap" class="hidden" style="margin-top:10px;">
+        <div class="tip" style="margin-bottom:8px;">按「截图所在列」设置识别类型与写入列。默认已按 AE→UID/DID、AF→小红书号、AG→手机型号 预填，可自行修改。</div>
+        <table>
+          <thead><tr><th style="width:90px;">截图列</th><th style="width:150px;">识别类型</th><th>写入列</th></tr></thead>
+          <tbody id="vlCfgBody"></tbody>
+        </table>
+        <div class="row" style="margin-top:10px;">
+          <button class="ghost" id="extractBtn">开始智能识别</button>
+          <span class="stat" id="vlStat"></span>
+        </div>
+      </div>
+    </div>
     <div class="row" style="margin-top:14px;">
       <button id="convertBtn">确认转换</button>
       <button class="ghost" id="rescanBtn">重新扫描</button>
@@ -172,6 +187,24 @@
     <div class="progress"><div id="bar"></div></div>
     <div class="stat" id="jobStat">准备中…</div>
     <div id="jobResults" style="margin-top:10px;"></div>
+  </div>
+
+  <!-- 步骤 5：智能识别结果预览（确认后才写入） -->
+  <div class="card hidden" id="extractCard">
+    <label>智能识别结果（确认无误后再写入）</label>
+    <div class="stat" id="extractSummary" style="margin-bottom:8px;"></div>
+    <div style="max-height:360px;overflow:auto;">
+      <table>
+        <thead><tr><th style="width:36px;"><input type="checkbox" id="exAll" checked /></th><th style="width:150px;">来源截图</th><th style="width:110px;">写入单元格</th><th>识别值（可修改）</th></tr></thead>
+        <tbody id="extractTable"></tbody>
+      </table>
+    </div>
+    <div class="row" style="margin-top:14px;">
+      <button id="applyBtn">确认写入</button>
+      <button class="ghost" id="backScanBtn">返回预览</button>
+    </div>
+    <div class="msg" id="applyMsg"></div>
+    <div class="tip">写入前会先把目标区间设为「文本」格式，避免 19 位 DID / 11 位手机号被当数值截断；写完立即回读比对，不一致会逐条标出。</div>
   </div>
 
 </div>
@@ -446,6 +479,8 @@ function renderPreview(d) {
     tb.appendChild(tr);
   });
   $('selectAll').checked = true;
+  buildVlConfig();
+  $('vlStat').textContent = '';
 }
 
 $('selectAll').onchange = (e) => {
@@ -496,6 +531,181 @@ function startPolling(jobId) {
     } catch(e) { /* ignore transient */ }
   }, 800);
 }
+
+// ---------------------------------------------------------------------------
+// 智能识别：截图 → 视觉模型 → 预览确认 → 写入
+// ---------------------------------------------------------------------------
+const VL_TYPES = {
+  douyin: { label: '抖音设置页', fields: [['user_id', 'UID 列'], ['device_id', 'DID 列']] },
+  xiaohongshu: { label: '小红书主页', fields: [['account', '账号列']] },
+  phone: { label: '手机型号', fields: [['model', '型号列']] },
+};
+// 默认映射（按你常用的表格模板预填，可随时在界面上改）
+const VL_DEFAULT = {
+  AE: { type: 'douyin', targets: { user_id: 'F', device_id: 'G' } },
+  AF: { type: 'xiaohongshu', targets: { account: 'H' } },
+  AG: { type: 'phone', targets: { model: 'AC' } },
+};
+let EXTRACT_ROWS = [];
+
+function renderTargets(col, type, targets) {
+  const td = document.getElementById('vltarget-' + col);
+  if (!td) return;
+  if (!type || !VL_TYPES[type]) { td.innerHTML = '<span class="stat">—</span>'; return; }
+  td.innerHTML = VL_TYPES[type].fields.map(([k, label]) =>
+    `<span class="stat">${label}</span> <input type="text" class="vlcol" data-col="${col}" data-k="${k}" value="${(targets && targets[k]) || ''}" style="width:48px;padding:4px 6px;border:1px solid var(--line);border-radius:6px;" />`
+  ).join(' &nbsp; ');
+}
+
+function buildVlConfig() {
+  const cols = [...new Set(SCAN.cells.map((c) => String(c.range).replace(/[0-9]/g, '')))].sort();
+  const tb = $('vlCfgBody'); tb.innerHTML = '';
+  cols.forEach((col) => {
+    const def = VL_DEFAULT[col] || { type: '', targets: {} };
+    const tr = document.createElement('tr');
+    tr.innerHTML = `<td class="range">${col}</td>
+      <td><select class="vltype" data-col="${col}">
+        <option value="">不识别</option>
+        <option value="douyin"${def.type === 'douyin' ? ' selected' : ''}>抖音设置页</option>
+        <option value="xiaohongshu"${def.type === 'xiaohongshu' ? ' selected' : ''}>小红书主页</option>
+        <option value="phone"${def.type === 'phone' ? ' selected' : ''}>手机型号</option>
+      </select></td>
+      <td id="vltarget-${col}"></td>`;
+    tb.appendChild(tr);
+    renderTargets(col, def.type, def.targets);
+  });
+  tb.querySelectorAll('.vltype').forEach((sel) => {
+    sel.onchange = () => renderTargets(sel.dataset.col, sel.value, (VL_DEFAULT[sel.dataset.col] || {}).targets);
+  });
+}
+
+function collectMapping() {
+  const mapping = {};
+  document.querySelectorAll('.vltype').forEach((sel) => {
+    const col = sel.dataset.col, type = sel.value;
+    if (!type) return;
+    const targets = {};
+    document.querySelectorAll(`.vlcol[data-col="${col}"]`).forEach((inp) => {
+      const v = inp.value.trim().toUpperCase();
+      if (v) targets[inp.dataset.k] = v;
+    });
+    if (Object.keys(targets).length) mapping[col] = { type, targets };
+  });
+  return mapping;
+}
+
+$('enableExtract').onchange = (e) => { if (e.target.checked) show($('vlCfgWrap')); else hide($('vlCfgWrap')); };
+$('exAll').onchange = (e) => { document.querySelectorAll('.exchk').forEach((c) => { c.checked = e.target.checked; }); };
+$('backScanBtn').onclick = () => { hide($('extractCard')); show($('previewCard')); };
+
+$('extractBtn').onclick = async () => {
+  const mapping = collectMapping();
+  if (!Object.keys(mapping).length) { alert('请至少为某一列选择识别类型，并填写要写入的列字母'); return; }
+  const chosen = SCAN.cells.filter((_, i) => document.querySelector(`.cellchk[data-i="${i}"]`).checked);
+  if (chosen.length === 0) { alert('请至少选择一个单元格'); return; }
+  try {
+    $('vlStat').textContent = '识别中…';
+    const r = await apiFetch('/api/extract', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ cells: chosen, mapping, concurrency: 5 }),
+    });
+    const d = await r.json();
+    if (!d.ok) { alert(d.error || '识别启动失败'); $('vlStat').textContent = ''; return; }
+    startExtractPolling(d.jobId);
+  } catch (e) { alert('请求失败：' + e.message); $('vlStat').textContent = ''; }
+};
+
+function startExtractPolling(jobId) {
+  hide($('previewCard'));
+  show($('extractCard'));
+  $('extractSummary').textContent = '识别中…（每张约 2 秒，5 路并发）';
+  $('extractTable').innerHTML = '';
+  if (JOB_TIMER) clearInterval(JOB_TIMER);
+  JOB_TIMER = setInterval(async () => {
+    try {
+      const r = await apiFetch('/api/job/' + jobId);
+      const d = await r.json();
+      if (!d.ok) return;
+      $('extractSummary').textContent = `已完成 ${d.done} / ${d.total}`;
+      if (d.status === 'finished' || d.status === 'error') {
+        clearInterval(JOB_TIMER);
+        renderExtract(d.results || []);
+      }
+    } catch (e) { /* 轮询瞬时失败忽略 */ }
+  }, 800);
+}
+
+function renderExtract(results) {
+  EXTRACT_ROWS = [];
+  const tb = $('extractTable'); tb.innerHTML = '';
+  const ok = results.filter((x) => x.status === 'done').length;
+  const fail = results.filter((x) => x.status === 'failed').length;
+  $('extractSummary').innerHTML = `识别完成：成功 <b class="res-ok">${ok}</b> · 失败 <b class="res-fail">${fail}</b>`;
+  results.forEach((x) => {
+    if (x.status === 'failed') {
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td></td><td class="range">${x.range}</td><td>—</td><td class="res-fail">识别失败：${x.error || ''}</td>`;
+      tb.appendChild(tr);
+      return;
+    }
+    if (x.status !== 'done') return;
+    Object.keys(x.targets || {}).forEach((k) => {
+      const col = x.targets[k];
+      const val = String((x.values || {})[k] ?? '');
+      if (!col || !val) return;
+      const idx = EXTRACT_ROWS.length;
+      EXTRACT_ROWS.push({ col, row: x.row, value: val });
+      const tr = document.createElement('tr');
+      tr.innerHTML = `<td><input type="checkbox" class="exchk" data-i="${idx}" checked /></td>
+        <td class="range">${x.range} <span class="tag">${x.type}</span></td>
+        <td class="range">${col}${x.row}</td>
+        <td><input type="text" class="exval" data-i="${idx}" value="${val.replace(/"/g, '&quot;')}" style="width:100%;padding:4px 6px;border:1px solid var(--line);border-radius:6px;" /></td>`;
+      tb.appendChild(tr);
+    });
+  });
+}
+
+$('applyBtn').onclick = async () => {
+  const sheetId = $('sheetSelect').value;
+  const puts = [];
+  document.querySelectorAll('.exchk').forEach((ch) => {
+    if (!ch.checked) return;
+    const i = Number(ch.dataset.i);
+    const inp = document.querySelector(`.exval[data-i="${i}"]`);
+    const base = EXTRACT_ROWS[i];
+    if (base && inp && inp.value.trim()) puts.push({ col: base.col, row: base.row, value: inp.value.trim() });
+  });
+  if (!puts.length) { alert('没有待写入的条目'); return; }
+  if (!confirm(`确认把 ${puts.length} 条识别结果写入表格？`)) return;
+  const msg = $('applyMsg');
+  msg.className = 'msg'; msg.textContent = '写入中…（含回读校验）';
+  try {
+    const r = await apiFetch('/api/apply', {
+      method: 'POST', headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ spreadsheetToken: RESOLVED.spreadsheetToken, sheetId, puts }),
+    });
+    const d = await r.json();
+    if (!d.ok) { msg.className = 'msg err'; msg.textContent = d.error || '写入失败'; return; }
+    const bad = d.badCount || 0;
+    msg.className = bad ? 'msg err' : 'msg ok';
+    msg.innerHTML = bad
+      ? `写入完成，但 <b>${bad}</b> 条回读不一致（可能被截断或转成了数值），请人工核对：<br>` +
+        (d.bad || []).map((b) => `${b.cell}：期望 ${b.want} / 实际 ${b.got}`).join('<br>')
+      : `写入完成，${puts.length} 条全部回读一致 ✓`;
+  } catch (e) { msg.className = 'msg err'; msg.textContent = '请求失败：' + e.message; }
+};
+
+// 启动时探测服务端是否配置了视觉识别 Key
+(async () => {
+  try {
+    const r = await apiFetch('/api/info');
+    const d = await r.json();
+    if (!d.vlReady) {
+      $('enableExtract').disabled = true;
+      show($('vlOff'));
+    }
+  } catch (e) { /* 忽略 */ }
+})();
 
 // （拼图方案下无需「插入列补救」横幅与按钮：多图已在转换时自动拼合写回原单元格。）
 </script>

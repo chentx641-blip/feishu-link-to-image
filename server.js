@@ -1039,6 +1039,219 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
 //   不新增任何列、不改表结构，彻底避免打乱整表顺序。）
 
 // ---------------------------------------------------------------------------
+// 智能识别：截图 → 视觉大模型 → 结构化字段
+// ---------------------------------------------------------------------------
+// 为什么必须放在服务端而不是「在对话里逐张读图」：
+//   图片一旦进入对话上下文就会常驻不释放。实测 42 张 1220x2656 的手机长截图
+//   累计约 17.5 万 token，直接撑爆上下文窗口导致任务中断（读过就废的一次性消耗品
+//   却持续占位）。改由服务端调视觉 API：图片只在请求体里过一遍，回来的只有纯文本
+//   JSON，对话占用几乎为零；再配合并发，75 张从「半小时且必中断」降到 1 分钟内。
+const DASHSCOPE_API_KEY = process.env.DASHSCOPE_API_KEY || '';
+const QWEN_VL_MODEL = process.env.QWEN_VL_MODEL || 'qwen-vl-max';
+const QWEN_VL_BASE = 'https://dashscope.aliyuncs.com/compatible-mode/v1';
+
+const EXTRACT_TYPES = {
+  douyin: { label: '抖音设置页', fields: ['user_id', 'device_id'] },
+  xiaohongshu: { label: '小红书主页', fields: ['account'] },
+  phone: { label: '手机型号', fields: ['model'] },
+};
+
+function buildPrompt(type) {
+  const lead = {
+    douyin: '这是抖音 App「设置」页截图。请找到 UserId 和 DeviceId 两项后面的数字，逐位精确抄写，不要漏位也不要多补。',
+    xiaohongshu: '这是小红书 App 个人主页截图。请找到「小红书号」后面的纯数字编号（不要昵称、不要带文字）。',
+    phone: '这是手机「关于本机」/设备信息页截图。请给出设备型号名称（如 Xiaomi 17 Pro）。',
+  }[type];
+  const schema = {
+    douyin: '{"user_id":"","device_id":""}',
+    xiaohongshu: '{"account":"","nickname":""}',
+    phone: '{"model":""}',
+  }[type];
+  if (!lead) return null;
+  return lead + '只返回 JSON，不要任何解释文字：' + schema;
+}
+
+// 模型偶尔会把 JSON 包在 ```json 代码块里，或前后带一句废话，这里统一剥壳
+function parseModelJSON(s) {
+  let t = String(s || '').trim();
+  t = t.replace(/^```(?:json)?/i, '').replace(/```\s*$/, '').trim();
+  const a = t.indexOf('{');
+  const b = t.lastIndexOf('}');
+  if (a >= 0 && b > a) t = t.slice(a, b + 1);
+  try { return JSON.parse(t); } catch (e) { throw new Error('无法解析模型输出: ' + t.slice(0, 200)); }
+}
+
+// 原图最大 6.7MB（1220x2656 手机长截图），直接 base64 约 9MB 容易撞 API 体积上限。
+// 缩到长边 1568 既能保证小字号不糊（抖音设置页的 19 位数字仍清晰），
+// 又把视觉 token 从约 4100 降到约 1400，成本与耗时同步下降。
+async function shrinkForVision(buf) {
+  try {
+    const sharp = getSharp();
+    if (!sharp) return buf;
+    const meta = await sharp(buf).metadata();
+    const MAX_SIDE = 1568;
+    if (!meta.width || !meta.height) return buf;
+    if (meta.width <= MAX_SIDE && meta.height <= MAX_SIDE) {
+      return buf.length > 1024 * 1024 ? await sharp(buf).jpeg({ quality: 85 }).toBuffer() : buf;
+    }
+    const out = await sharp(buf)
+      .resize({ width: MAX_SIDE, height: MAX_SIDE, fit: 'inside', withoutEnlargement: true })
+      .jpeg({ quality: 85 })
+      .toBuffer();
+    return out;
+  } catch (e) {
+    return buf; // 压缩失败就用原图，不阻断识别
+  }
+}
+
+async function recognizeImage(buf, type) {
+  if (!DASHSCOPE_API_KEY) throw new Error('服务端未配置 DASHSCOPE_API_KEY');
+  const prompt = buildPrompt(type);
+  if (!prompt) throw new Error('未知识别类型: ' + type);
+  const small = await shrinkForVision(buf);
+  const b64 = small.toString('base64');
+  const body = {
+    model: QWEN_VL_MODEL,
+    messages: [{
+      role: 'user',
+      content: [
+        { type: 'image_url', image_url: { url: 'data:image/jpeg;base64,' + b64 } },
+        { type: 'text', text: prompt },
+      ],
+    }],
+    max_tokens: 300,
+  };
+  const resp = await fetch(QWEN_VL_BASE + '/chat/completions', {
+    method: 'POST',
+    headers: { Authorization: 'Bearer ' + DASHSCOPE_API_KEY, 'Content-Type': 'application/json' },
+    body: JSON.stringify(body),
+  });
+  const text = await resp.text();
+  let json;
+  try { json = JSON.parse(text); } catch (e) { throw new Error('视觉 API 返回非 JSON: ' + text.slice(0, 200)); }
+  if (!resp.ok) {
+    throw new Error('视觉 API ' + resp.status + ': ' + ((json.error && json.error.message) || text.slice(0, 200)));
+  }
+  const content = (json.choices && json.choices[0] && json.choices[0].message && json.choices[0].message.content) || '';
+  return parseModelJSON(content);
+}
+
+// 受控并发：limit 路并行，保持输入顺序输出结果
+async function mapLimit(items, limit, fn) {
+  const out = new Array(items.length);
+  let i = 0;
+  async function worker() {
+    while (true) {
+      const idx = i++;
+      if (idx >= items.length) return;
+      out[idx] = await fn(items[idx], idx);
+    }
+  }
+  const n = Math.max(1, Math.min(10, limit || 5));
+  await Promise.all(Array.from({ length: Math.min(n, items.length) }, worker));
+  return out;
+}
+
+// 识别任务：只识别不写表，结果交给前端预览确认后再落表
+function startExtractJob(cells, mapping, concurrency) {
+  const id = String(seq++);
+  const job = { id, mode: 'extract', status: 'running', total: cells.length, done: 0, results: [], startedAt: Date.now() };
+  jobs.set(id, job);
+  (async () => {
+    try {
+      const limit = Math.max(1, Math.min(10, concurrency || 5));
+      await mapLimit(cells, limit, async (c) => {
+        const colName = String(c.range || '').replace(/[0-9]/g, '');
+        const cfg = mapping && mapping[colName];
+        const r = { range: c.range, row: c.row, col: colName, status: 'pending', type: (cfg && cfg.type) || null };
+        try {
+          if (!cfg || !cfg.type || !EXTRACT_TYPES[cfg.type]) {
+            r.status = 'skipped';
+            r.reason = '该列未配置识别';
+          } else {
+            const buf = await downloadImage(c.url || (c.urls && c.urls[0]));
+            const data = await recognizeImage(buf, cfg.type);
+            r.status = 'done';
+            r.values = data;
+            r.targets = cfg.targets || {};
+          }
+        } catch (e) {
+          r.status = 'failed';
+          r.error = String(e.message || e).slice(0, 300);
+        }
+        job.done++;
+        job.results.push(r);
+      });
+      job.status = 'finished';
+    } catch (e) {
+      job.status = 'error';
+      job.error = String(e.message || e);
+    }
+  })();
+  return job;
+}
+
+// 把待写格子按列归并成连续区间，减少写表 API 调用次数
+function buildRanges(puts) {
+  const byCol = new Map();
+  for (const p of puts) {
+    if (!p.col || !p.value) continue;
+    if (!byCol.has(p.col)) byCol.set(p.col, []);
+    byCol.get(p.col).push(p);
+  }
+  const mk = (col, seg) => ({
+    range: col + seg[0].row + ':' + col + seg[seg.length - 1].row,
+    values: seg.map((s) => [s.value]),
+    rows: seg.map((s) => s.row),
+  });
+  const out = [];
+  for (const [col, list] of byCol) {
+    list.sort((a, b) => a.row - b.row);
+    let seg = [list[0]];
+    for (let i = 1; i < list.length; i++) {
+      if (list[i].row === seg[seg.length - 1].row + 1) seg.push(list[i]);
+      else { out.push(mk(col, seg)); seg = [list[i]]; }
+    }
+    out.push(mk(col, seg));
+  }
+  return out;
+}
+
+// 写入并「回读校验」：19 位 DID / 11 位手机号一旦被当数值就会丢精度，
+// 所以先把目标区间设为文本格式再写值，写完立刻读回来比对位数。
+async function applyValues(spreadsheetToken, sheetId, puts) {
+  const token = await getValidToken();
+  const groups = buildRanges(puts);
+  const results = [];
+  for (const g of groups) {
+    const range = sheetId + '!' + g.range;
+    try {
+      await feishuCall('PUT', '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/style', {
+        body: { appendStyle: { range, style: { formatter: '@' } } }, token,
+      });
+    } catch (e) { /* 样式设置失败不阻断写入，靠回读兜底发现问题 */ }
+    const wr = await feishuCall('PUT', '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values', {
+      body: { valueRange: { range, values: g.values } }, token,
+    });
+    results.push({ range: g.range, rows: g.rows, code: wr.code, msg: wr.msg || null });
+    await sleep(120);
+  }
+  // 回读校验
+  const verify = [];
+  for (const p of puts) {
+    if (!p.col || !p.value) continue;
+    const rr = await feishuCall('GET', '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values/' + sheetId + '!' + p.col + p.row + ':' + p.col + p.row,
+      { params: { valueRenderOption: 'ToString' }, token });
+    const got = rr && rr.data && rr.data.valueRange && rr.data.valueRange.values && rr.data.valueRange.values[0] ? String(rr.data.valueRange.values[0][0] || '') : '';
+    verify.push({
+      cell: p.col + p.row, want: p.value, got,
+      ok: got === String(p.value),
+    });
+  }
+  return { writes: results, verify };
+}
+
+// ---------------------------------------------------------------------------
 // HTTP 服务
 // ---------------------------------------------------------------------------
 function readBody(req) {
@@ -1102,6 +1315,9 @@ const server = http.createServer(async (req, res) => {
         tokenReady: !!(tokenStore && tokenStore.access_token),
         sharpReady: (() => { try { getSharp(); return true; } catch (e) { return false; } })(),
         sharpError: (() => { try { getSharp(); return null; } catch (e) { return String(e && e.message || e); } })(),
+        vlReady: !!DASHSCOPE_API_KEY,
+        vlModel: DASHSCOPE_API_KEY ? QWEN_VL_MODEL : null,
+        extractTypes: EXTRACT_TYPES,
         version: '2.7',
         build: '2026-09-06-bitable-support',
       });
@@ -1245,6 +1461,42 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, { ok: true, jobId: job.id, total: job.total });
     }
 
+    // ---- 智能识别：截图 → 视觉模型 → 结构化字段（只识别不写表，供前端预览确认）----
+    if (req.method === 'POST' && urlp === '/api/extract') {
+      const body = await readBody(req);
+      if (!gateOK(req, res, body)) return;
+      const cells = Array.isArray(body.cells) ? body.cells : [];
+      const mapping = body.mapping || {};
+      if (cells.length === 0) return sendJSON(res, 400, { ok: false, error: '待识别列表为空' });
+      if (!DASHSCOPE_API_KEY) return sendJSON(res, 200, { ok: false, error: '服务端未配置 DASHSCOPE_API_KEY 环境变量' });
+      const targets = cells.filter((c) => {
+        const colName = String(c.range || '').replace(/[0-9]/g, '');
+        return mapping[colName] && mapping[colName].type;
+      });
+      if (targets.length === 0) return sendJSON(res, 200, { ok: false, error: '没有任何列配置了识别类型' });
+      const job = startExtractJob(targets, mapping, body.concurrency || 5);
+      return sendJSON(res, 200, { ok: true, jobId: job.id, total: job.total, model: QWEN_VL_MODEL });
+    }
+
+    // ---- 智能识别：把确认过的结果写入表格（写入前设文本格式，写完立刻回读校验）----
+    if (req.method === 'POST' && urlp === '/api/apply') {
+      const body = await readBody(req);
+      if (!gateOK(req, res, body)) return;
+      const spreadsheetToken = body.spreadsheetToken;
+      const sheetId = body.sheetId;
+      const puts = Array.isArray(body.puts) ? body.puts : [];
+      if (!spreadsheetToken || !sheetId || puts.length === 0) {
+        return sendJSON(res, 400, { ok: false, error: '缺少参数或待写入列表为空' });
+      }
+      try {
+        const out = await applyValues(spreadsheetToken, sheetId, puts);
+        const bad = (out.verify || []).filter((v) => !v.ok);
+        return sendJSON(res, 200, { ok: true, writes: out.writes, verify: out.verify, badCount: bad.length, bad });
+      } catch (e) {
+        return sendJSON(res, 200, { ok: false, error: '写入失败：' + String(e.message || e).slice(0, 500) });
+      }
+    }
+
     // （拼图方案下不再需要「插入列补救」接口；多图已在转换时自动拼合写回原单元格。）
 
     // ---- 多维表格：列出字段（链接字段 / 附件字段下拉用）----
@@ -1300,11 +1552,19 @@ const server = http.createServer(async (req, res) => {
   }
 });
 
-server.listen(PORT, () => {
-  console.log('[server] 飞书图片链接转换服务（运营版）已启动: http://localhost:' + PORT);
-  console.log('[server] 飞书应用凭证: ' + (FEISHU_APP_ID ? '已配置' : '未配置（OAuth 初始化前需配置）'));
-  // 启动恢复令牌（本地/云空间），失败仅记录，等待管理员重新授权
-  bootstrapToken()
-    .then((t) => console.log('[boot] 令牌恢复: ' + (t && t.access_token ? '成功（含云空间持久化）' : '无（等待管理员初始化授权）')))
-    .catch((e) => console.log('[boot] 令牌恢复失败（可忽略）: ' + e.message));
-});
+// 被 require 时只导出函数、不监听端口，便于单独对识别逻辑做自测（不影响 node server.js 正常启动）
+if (require.main === module) {
+  server.listen(PORT, () => {
+    console.log('[server] 飞书图片链接转换服务（运营版）已启动: http://localhost:' + PORT);
+    console.log('[server] 飞书应用凭证: ' + (FEISHU_APP_ID ? '已配置' : '未配置（OAuth 初始化前需配置）'));
+    // 启动恢复令牌（本地/云空间），失败仅记录，等待管理员重新授权
+    bootstrapToken()
+      .then((t) => console.log('[boot] 令牌恢复: ' + (t && t.access_token ? '成功（含云空间持久化）' : '无（等待管理员初始化授权）')))
+      .catch((e) => console.log('[boot] 令牌恢复失败（可忽略）: ' + e.message));
+  });
+}
+
+module.exports = {
+  recognizeImage, buildPrompt, parseModelJSON, mapLimit,
+  buildRanges, applyValues, startExtractJob, EXTRACT_TYPES,
+};
