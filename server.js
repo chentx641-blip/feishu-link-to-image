@@ -1175,17 +1175,20 @@ const EXTRACT_TYPES = {
 
 function buildPrompt(type) {
   const lead = {
-    douyin: '这是抖音 App「设置」页截图。请找到 UserId 和 DeviceId 两项后面的数字，逐位精确抄写，不要漏位也不要多补。',
-    xiaohongshu: '这是小红书 App 个人主页截图。请找到「小红书号」后面的纯数字编号（不要昵称、不要带文字）。',
+    douyin: '这是抖音 App「设置」页截图。请找到 UserId 和 DeviceId 两项后面的数字，逐位精确抄写，不要漏位也不要多补、不要替它补零。',
+    xiaohongshu: '这是小红书 App 个人主页截图。请找到「小红书号」后面的编号（不要昵称），逐字符精确抄写——若有数字与字母混合也要原样保留，不要漏位也不要多补、不要替它补零。',
     phone: '这是手机「关于本机」/设备信息页截图。请给出设备型号名称（如 Xiaomi 17 Pro）。',
   }[type];
+  // 关键兜底：用户上传错误截图时，模型之前会"幻觉"编造数字（典型如 1688888888 这种重复数字）。
+  // 明确告知：不是预期页 → 找不到字段 → 必须填「未知」，禁止凭猜测编造。
+  const guard = '重要：若截图并非上述对应页面（如上传了搜索结果页、别人主页、空白页、聊天截图、表情包等），或看不清/找不到对应字段，必须把对应字段填为「未知」；严禁凭记忆、上下文或合理猜测编造任何数字或文字，宁可填「未知」也不许编。';
   const schema = {
     douyin: '{"user_id":"","device_id":""}',
     xiaohongshu: '{"account":"","nickname":""}',
     phone: '{"model":""}',
   }[type];
   if (!lead) return null;
-  return lead + '只返回 JSON，不要任何解释文字：' + schema;
+  return lead + guard + '只返回 JSON，不要任何解释文字：' + schema;
 }
 
 // 模型偶尔会把 JSON 包在 ```json 代码块里，或前后带一句废话，这里统一剥壳
