@@ -16,6 +16,10 @@
     --ok: #2ba471;
     --err: #d54941;
     --warn: #e37318;
+    /* 「提取信息」专用色：与「转换」的蓝色形成明确区分 */
+    --extract: #7b5cf0;
+    --extract-d: #653fd9;
+    --extract-bg: #f7f4ff;
   }
   * { box-sizing: border-box; }
   body {
@@ -65,18 +69,87 @@
   .res-fail { color: var(--err); }
   .tip { font-size: 12px; color: var(--muted); background: #f0f4fb; border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
   .count-badge { display: inline-block; background: var(--primary); color:#fff; border-radius: 999px; padding: 1px 10px; font-size: 12px; margin-left: 6px; }
+
+  /* ---------- 首屏：两条路的区别（第一次用的人先看这里）---------- */
+  .guide { display: grid; grid-template-columns: 1fr 1fr; gap: 12px; margin-bottom: 16px; }
+  @media (max-width: 720px) { .guide { grid-template-columns: 1fr; } }
+  .guide-item { background: var(--card); border: 1px solid var(--line); border-radius: 12px; padding: 14px 16px; border-top: 3px solid var(--line); }
+  .guide-item.g-convert { border-top-color: var(--primary); }
+  .guide-item.g-extract { border-top-color: var(--extract); }
+  .gi-head { font-weight: 700; font-size: 15px; margin-bottom: 6px; }
+  .gi-body { font-size: 13px; }
+  .gi-when { font-size: 12px; color: var(--muted); margin-top: 8px; border-top: 1px dashed var(--line); padding-top: 8px; }
+
+  /* ---------- 步骤条 ---------- */
+  .stepper { display: flex; gap: 6px; flex-wrap: wrap; margin-bottom: 16px; }
+  .stp { display: flex; align-items: center; gap: 6px; font-size: 12px; color: var(--muted); background: var(--card); border: 1px solid var(--line); border-radius: 999px; padding: 5px 12px; }
+  .stp-dot { width: 18px; height: 18px; border-radius: 50%; background: #eef1f6; color: var(--muted); display: flex; align-items: center; justify-content: center; font-size: 11px; font-weight: 700; }
+  .stp.active { border-color: var(--primary); color: var(--primary-d); background: #eef4ff; font-weight: 600; }
+  .stp.active .stp-dot { background: var(--primary); color: #fff; }
+  .stp.done .stp-dot { background: var(--ok); color: #fff; }
+
+  /* ---------- 卡片步骤标题 ---------- */
+  .step-head { display: flex; gap: 10px; align-items: flex-start; margin-bottom: 12px; }
+  .step-no { flex: 0 0 auto; width: 24px; height: 24px; border-radius: 50%; background: var(--primary); color: #fff; font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center; }
+  .step-title { font-weight: 700; font-size: 15px; line-height: 1.4; }
+  .step-sub { font-size: 12px; color: var(--muted); margin-top: 2px; }
+
+  /* ---------- 预览卡里的两个独立操作分区 ---------- */
+  .lane { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-top: 14px; background: #fcfdff; }
+  .lane-a { border-left: 4px solid var(--primary); }
+  .lane-b { border-left: 4px solid var(--extract); background: var(--extract-bg); }
+  .lane-head { font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
+  .lane-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
+  .lane-a .lane-dot { background: var(--primary); }
+  .lane-b .lane-dot { background: var(--extract); }
+  .lane-tag { font-size: 11px; font-weight: 400; color: var(--warn); background: #fff3e8; border-radius: 999px; padding: 1px 8px; }
+  .lane-desc { font-size: 12.5px; color: var(--muted); margin: 6px 0 10px; }
+  .lane-toggle { font-size: 13px; color: var(--text); display: flex; align-items: center; gap: 8px; margin-bottom: 0; }
+  button.btn-extract { background: var(--extract); }
+  button.btn-extract:hover { background: var(--extract-d); }
+  .vtip { font-size: 12px; color: var(--muted); background: #f0f4fb; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
 </style>
 </head>
 <body>
 <div class="wrap">
   <header>
-    <h1>飞书表格 · 图片链接转图片</h1>
-    <p>支持电子表格与多维表格：粘贴链接后自动识别。电子表格会把「图片链接」单元格替换为内嵌图片；多维表格可指定「链接字段 → 附件字段」批量转换。</p>
+    <h1>飞书表格 · 图片处理工具</h1>
+    <p>这个页面能做两件<b>相互独立</b>的事，先看清区别，再决定做哪件（可以只做一件，也可以都做）。</p>
   </header>
+
+  <!-- 首屏导航：两条路到底差在哪 -->
+  <div class="guide">
+    <div class="guide-item g-convert">
+      <div class="gi-head">🔵 链接转图片</div>
+      <div class="gi-body">单元格里是一串<b>网址</b>，想让它变成<b>看得见的图片</b>。</div>
+      <div class="gi-when">用在这：问卷星 / 表单导出的图片链接</div>
+    </div>
+    <div class="guide-item g-extract">
+      <div class="gi-head">🟣 提取信息</div>
+      <div class="gi-body">单元格里是一张<b>截图</b>，想把图里的 <b>UID / 小红书号 / 手机型号</b> 抄成文字。</div>
+      <div class="gi-when">用在这：人工粘贴的抖音、小红书、设置页截图</div>
+    </div>
+  </div>
+
+  <!-- 当前进度：第一次用的人靠它知道自己走到哪了 -->
+  <div class="stepper" id="stepper">
+    <div class="stp" data-step="1" id="stp1"><span class="stp-dot">1</span><span>验证口令</span></div>
+    <div class="stp" data-step="2"><span class="stp-dot">2</span><span>粘贴表格链接</span></div>
+    <div class="stp" data-step="3"><span class="stp-dot">3</span><span>选择数据表</span></div>
+    <div class="stp" data-step="4"><span class="stp-dot">4</span><span>预览与操作</span></div>
+    <div class="stp" data-step="5"><span class="stp-dot">5</span><span>执行结果</span></div>
+  </div>
 
   <!-- 访问口令（部署到公网时由所有者提供） -->
   <div class="card" id="gateCard">
-    <label>访问口令（由文档所有者提供）</label>
+    <div class="step-head">
+      <span class="step-no">1</span>
+      <div>
+        <div class="step-title">验证口令</div>
+        <div class="step-sub">口令由文档所有者提供，验证一次即可，浏览器会记住。</div>
+      </div>
+    </div>
+    <label>访问口令</label>
     <div class="row">
       <input type="text" id="accessCode" placeholder="请输入访问口令" autocomplete="off" />
       <button id="gateBtn" class="ghost">验证口令</button>
@@ -105,7 +178,14 @@
 
   <!-- 步骤 1：解析（验证口令后展开） -->
   <div class="card hidden" id="resolveCard">
-    <label>飞书文档链接（电子表格 / wiki 链接均可）</label>
+    <div class="step-head">
+      <span class="step-no">2</span>
+      <div>
+        <div class="step-title">粘贴飞书表格链接</div>
+        <div class="step-sub">电子表格、wiki 链接、多维表格都可以。请确保该表格已共享给本工具的创建者。</div>
+      </div>
+    </div>
+    <label>飞书文档链接</label>
     <div class="row">
       <input type="text" id="url" placeholder="https://kgu4p60vfl.feishu.cn/wiki/..." />
       <button id="resolveBtn">解析文档</button>
@@ -115,7 +195,13 @@
 
   <!-- 多维表格模式（粘贴多维表格链接后自动出现） -->
   <div class="card hidden" id="bitableCard">
-    <div class="stat" style="margin-bottom:6px;">📊 已识别为 <b>多维表格</b>，请选择数据表与字段：</div>
+    <div class="step-head">
+      <span class="step-no">3</span>
+      <div>
+        <div class="step-title">选择数据表与字段</div>
+        <div class="step-sub">已识别为「多维表格」。此模式只做 🔵 <b>链接转图片</b>（写入附件字段），不涉及 🟣 提取信息。</div>
+      </div>
+    </div>
     <label>选择数据表</label>
     <div class="row">
       <select id="btTable" style="padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;min-width:200px;"></select>
@@ -139,66 +225,135 @@
 
   <!-- 步骤 2：选择子表 + 扫描 -->
   <div class="card hidden" id="sheetCard">
-    <label>选择子表</label>
-    <div class="row">
-      <select id="sheetSelect" style="padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;min-width:200px;"></select>
-      <select id="sourceSelect" style="padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;">
-        <option value="embed">单元格内嵌图片（人工粘贴的截图）</option>
-        <option value="link">图片链接文本（问卷星/表单导出）</option>
-        <option value="both">两者都要</option>
-      </select>
+    <div class="step-head">
+      <span class="step-no">3</span>
+      <div>
+        <div class="step-title">选择子表，然后扫描</div>
+        <div class="step-sub">先告诉工具「图片在表里是什么形式」，再点扫描。</div>
+      </div>
+    </div>
+    <div class="row" style="align-items:flex-end;">
+      <div style="flex:1;min-width:220px;">
+        <label>① 要处理哪个子表</label>
+        <select id="sheetSelect" style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;"></select>
+      </div>
+      <div style="flex:1;min-width:250px;">
+        <label>② 图片是什么形式</label>
+        <select id="sourceSelect" style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;">
+          <option value="embed">截图直接粘在单元格里（内嵌图片）</option>
+          <option value="link">单元格里是一串网址（图片链接）</option>
+          <option value="both">两种都有 / 不确定</option>
+        </select>
+      </div>
       <button id="scanBtn">扫描图片</button>
     </div>
-    <div class="tip" style="margin-top:6px;">图片来源说明：截图是<b>直接粘贴进单元格</b>的选「单元格内嵌图片」；单元格里是<b>一串网址</b>的选「图片链接文本」。</div>
+    <div class="tip" style="margin-top:10px;">
+      <b>② 怎么选？</b>在飞书里点一下那个单元格：直接显示出一张图 → 选第一项；显示的是一串 <code>http…</code> 网址文本 → 选第二项；拿不准就选「两种都有」（稍慢一点，但不会漏）。
+    </div>
     <div class="msg" id="scanMsg"></div>
   </div>
 
-  <!-- 步骤 3：预览 + 确认转换 -->
+  <!-- 步骤 4：预览 + 两个独立操作（转换 / 提取信息） -->
   <div class="card hidden" id="previewCard">
+    <div class="step-head">
+      <span class="step-no">4</span>
+      <div>
+        <div class="step-title">预览，然后选择要做哪件事</div>
+        <div class="step-sub">下面的 <b>🔵 操作 A</b> 和 <b>🟣 操作 B</b> 是两件<b>互不影响</b>的事：可以只做一件，也可以都做。做完一件不会自动做另一件。</div>
+      </div>
+    </div>
+
     <div class="row" style="justify-content:space-between;align-items:center;">
-      <div><b id="scanCount">0</b> 个图片单元格<span class="count-badge" id="sheetNameBadge"></span><span class="count-badge" id="srcBadge"></span></div>
+      <div>扫描到 <b id="scanCount">0</b> 个图片单元格<span class="count-badge" id="sheetNameBadge"></span><span class="count-badge" id="srcBadge"></span></div>
       <label style="margin:0;"><input type="checkbox" id="selectAll" checked /> 全选</label>
     </div>
-    <div style="max-height:320px;overflow:auto;margin-top:8px;">
+    <div style="max-height:260px;overflow:auto;margin-top:8px;">
       <table>
-        <thead><tr><th style="width:36px;"></th><th>单元格</th><th>类型</th><th>图片链接</th></tr></thead>
+        <thead><tr><th style="width:36px;"></th><th>单元格</th><th>类型</th><th>图片链接 / 图片标识</th></tr></thead>
         <tbody id="cellTable"></tbody>
       </table>
     </div>
-    <div id="vlBox" style="margin-top:14px;border:1px dashed var(--line);border-radius:8px;padding:12px;">
-      <label style="margin:0;"><input type="checkbox" id="enableExtract" /> 智能识别截图内容（AI 提取 UID / 小红书号 / 手机型号）</label>
-      <div id="vlOff" class="stat hidden" style="margin-top:6px;">服务端未配置视觉识别 Key，识别功能当前不可用。</div>
-      <div id="vlCfgWrap" class="hidden" style="margin-top:10px;">
-        <div class="tip" style="margin-bottom:8px;">按「截图所在列」设置识别类型与写入列。默认已按 AE→UID/DID、AF→小红书号、AG→手机型号 预填，可自行修改。</div>
+
+    <!-- ============ 操作 A：链接 → 图片 ============ -->
+    <div class="lane lane-a" id="laneConvert">
+      <div class="lane-head">
+        <span class="lane-dot"></span>操作 A · 链接转图片
+        <span class="lane-tag">会修改表格</span>
+      </div>
+      <div class="lane-desc">
+        把上表中勾选的 <b>「图片链接」</b> 单元格，替换成能直接看到的图片。
+        <br>· 上表里如果只有「内嵌图片」，说明图早就已经在表里了，<b>不需要做这一步</b>。
+        <br>· 只对勾选的单元格生效，已内嵌图片 / 纯文本 / 空格子都不会被改动。
+      </div>
+      <div class="row">
+        <button id="convertBtn">开始转换（链接 → 图片）</button>
+      </div>
+    </div>
+
+    <!-- ============ 操作 B：截图 → 文字 ============ -->
+    <div class="lane lane-b">
+      <div class="lane-head">
+        <span class="lane-dot"></span>操作 B · 提取信息（截图 → 文字）
+        <span class="lane-tag">会修改表格</span>
+      </div>
+      <div class="lane-desc">
+        让 AI <b>看图</b>，把截图里的 <b>UID / DID / 小红书号 / 手机型号</b> 抄成文字，写进你指定的列。
+        <br>· 与操作 A <b>无关</b>：不做转换也能单独提取；图片是链接还是内嵌图都能提取。
+        <br>· 识别完会先给你一张表核对，确认后才真正写进表格。
+      </div>
+
+      <label class="lane-toggle"><input type="checkbox" id="enableExtract" /> 我要提取信息（勾选后展开设置）</label>
+      <div id="vlOff" class="stat hidden" style="margin-top:6px;">服务端未配置视觉识别 Key，提取功能当前不可用。</div>
+
+      <div id="vlCfgWrap" class="hidden" style="margin-top:12px;">
+        <div class="vtip">
+          按「<b>截图在哪一列</b>」设置两件事：<b>这是什么截图</b> → <b>识别结果写到哪一列</b>。
+          已按常用模板预填（AE→UID、DID ／ AF→小红书号 ／ AG→手机型号），<b>通常只需核对，不用改</b>。
+        </div>
         <table>
-          <thead><tr><th style="width:90px;">截图列</th><th style="width:150px;">识别类型</th><th>写入列</th></tr></thead>
+          <thead><tr><th style="width:90px;">截图在哪一列</th><th style="width:170px;">这是什么截图</th><th>识别结果写到哪一列</th></tr></thead>
           <tbody id="vlCfgBody"></tbody>
         </table>
-        <label style="margin-top:10px;display:block;"><input type="checkbox" id="skipFilled" checked /> 跳过已提取的行（目标列任一列已有值就不重复识别）</label>
+        <label style="margin-top:10px;display:block;"><input type="checkbox" id="skipFilled" checked /> 跳过已经填过的行（目标列已有内容就不重复识别，避免覆盖人工录入的数据）</label>
         <div class="row" style="margin-top:10px;">
-          <button class="ghost" id="extractBtn">开始智能识别</button>
+          <button class="btn-extract" id="extractBtn">开始提取信息</button>
           <span class="stat" id="vlStat"></span>
         </div>
       </div>
     </div>
+
     <div class="row" style="margin-top:14px;">
-      <button id="convertBtn">确认转换</button>
       <button class="ghost" id="rescanBtn">重新扫描</button>
     </div>
-    <div class="tip">⚠️ 转换会真实修改你的飞书表格（用图片替换对应链接单元格）。已内嵌图片 / 纯文本 / 空单元格不会被改动。建议先确认预览列表无误再转换。</div>
+    <div class="tip">⚠️ 操作 A / B 都会真实修改你的飞书表格。建议先确认上面的预览列表无误，再动手。</div>
   </div>
 
   <!-- 步骤 4：进度 -->
   <div class="card hidden" id="jobCard">
-    <label>转换进度</label>
+    <div class="step-head">
+      <span class="step-no">5</span>
+      <div>
+        <div class="step-title">转换进度</div>
+        <div class="step-sub">🔵 操作 A「链接转图片」正在执行，完成后可关闭本页。</div>
+      </div>
+    </div>
     <div class="progress"><div id="bar"></div></div>
     <div class="stat" id="jobStat">准备中…</div>
     <div id="jobResults" style="margin-top:10px;"></div>
+    <div class="row" style="margin-top:12px;">
+      <button class="ghost" id="backFromJobBtn">返回预览（可继续做「提取信息」）</button>
+    </div>
   </div>
 
   <!-- 步骤 5：智能识别结果预览（确认后才写入） -->
   <div class="card hidden" id="extractCard">
-    <label>智能识别结果（确认无误后再写入）</label>
+    <div class="step-head">
+      <span class="step-no">5</span>
+      <div>
+        <div class="step-title">提取结果 · 先核对，再写入</div>
+        <div class="step-sub">🟣 操作 B 已识别完成。下面是「哪张截图 → 写了什么值」，<b>直接改输入框</b>即可修正，取消勾选则不写入该条。</div>
+      </div>
+    </div>
     <div class="stat" id="extractSummary" style="margin-bottom:8px;"></div>
     <div style="max-height:360px;overflow:auto;">
       <table>
@@ -223,8 +378,27 @@ let SCAN = null;         // { total, cells:[...] }
 let BT_FIELDS = null;    // 多维表格字段列表 [{field_id, field_name, type}]
 let JOB_TIMER = null;
 
-function show(el){ el.classList.remove('hidden'); }
-function hide(el){ el.classList.add('hidden'); }
+function show(el){ el.classList.remove('hidden'); updateStepper(); }
+function hide(el){ el.classList.add('hidden'); updateStepper(); }
+
+// 进度条：只在原有显隐动作上「顺带」同步高亮，不改动任何流程逻辑。
+// 取「当前可见卡片里最大的步骤号」作为当前位置（步骤号越大说明越靠后）。
+const STEP_OF = { gateCard: 1, resolveCard: 2, sheetCard: 3, bitableCard: 3, previewCard: 4, jobCard: 5, extractCard: 5 };
+function updateStepper(){
+  const st = $('stepper');
+  if (!st) return;
+  let cur = 0;
+  Object.keys(STEP_OF).forEach((id) => {
+    const el = $(id);
+    if (el && !el.classList.contains('hidden')) cur = Math.max(cur, STEP_OF[id]);
+  });
+  st.querySelectorAll('.stp').forEach((n) => {
+    const s = Number(n.dataset.step);
+    n.classList.toggle('active', s === cur);
+    n.classList.toggle('done', s < cur);
+  });
+}
+updateStepper(); // 首屏先把第 1 步点亮
 
 // 访问口令：本地存储 + 每个请求自动带上
 const CODE_KEY = 'flc_access_code';
@@ -291,6 +465,7 @@ function applyAdminMode(isAdmin) {
     const d = await r.json();
     if (!d.gateEnabled) {
       hide($('gateCard'));
+      const s1 = $('stp1'); if (s1) hide(s1);   // 无需口令时，进度条里的第 1 步也去掉
       show($('resolveCard'));   // 无口令时直接可用
     }
   } catch (e) { /* 本地模式忽略 */ }
@@ -478,8 +653,8 @@ function renderPreview(d) {
   $('sheetNameBadge').textContent = $('sheetSelect').value;
   const srcLabel = { link: '图片链接', embed: '内嵌图片', both: '链接+内嵌' }[d.imageSource || 'link'];
   $('srcBadge').textContent = srcLabel;
-  // 内嵌图片无需「转换」，隐藏转换按钮，只保留识别
-  if (d.imageSource === 'embed') { hide($('convertBtn')); } else { show($('convertBtn')); }
+  // 内嵌图片无需「转换」：整个「操作 A」分区收起，只留「操作 B 提取信息」
+  if (d.imageSource === 'embed') { hide($('laneConvert')); } else { show($('laneConvert')); }
   const tb = $('cellTable'); tb.innerHTML = '';
   d.cells.forEach((c, i) => {
     const tr = document.createElement('tr');
@@ -506,6 +681,8 @@ $('selectAll').onchange = (e) => {
 };
 
 $('rescanBtn').onclick = () => { hide($('previewCard')); $('scanMsg').textContent=''; };
+// 转换做完后允许回到预览，接着做「提取信息」（两件事互不影响，可先后做）
+$('backFromJobBtn').onclick = () => { hide($('jobCard')); show($('previewCard')); };
 
 $('convertBtn').onclick = async () => {
   const sheetId = $('sheetSelect').value;
