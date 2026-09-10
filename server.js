@@ -265,7 +265,7 @@ function colLetter(n) {
 }
 
 const IMG_EXT = ['jpg', 'jpeg', 'png', 'gif', 'webp', 'bmp', 'svg', 'heic', 'avif', 'jfif', 'tiff'];
-const IMG_HOST_HINT = ['sojump', 'myqcloud.com', 'qpic.cn', 'aliyuncs.com', 'oss-cn', 'pstatp', 'byteimg', 'volcstatic'];
+const IMG_HOST_HINT = ['sojump', 'wjx', 'xmplus', 'surveyplus', 'myqcloud.com', 'qpic.cn', 'aliyuncs.com', 'oss-cn', 'pstatp', 'byteimg', 'volcstatic'];
 
 function isImageUrl(u) {
   if (!u || typeof u !== 'string') return false;
@@ -542,6 +542,28 @@ function cellToText(v) {
   return String(v);
 }
 
+// 收集单元格里的所有 hyperlink 字段（Formula 渲染模式下 link 字段才会出现在响应里）
+// 典型场景：单元格显示为「10777740685083648_G1_1784771249514.jpg」这种裸文件名，
+//   实际链接是 https://www.xmplus.cn/api/survey/files?url=...，被超链接包裹而非裸文本。
+// valueRenderOption=ToString 会把 link 字段丢掉，必须 Formula 渲染才能拿到。
+function cellLinks(v) {
+  const out = [];
+  const seen = new Set();
+  const walk = (x) => {
+    if (x == null) return;
+    if (Array.isArray(x)) { x.forEach(walk); return; }
+    if (typeof x === 'object') {
+      if (typeof x.link === 'string' && x.link && !seen.has(x.link)) {
+        seen.add(x.link);
+        out.push(x.link);
+      }
+      return;
+    }
+  };
+  walk(v);
+  return out;
+}
+
 // 下载单元格内嵌图片（fileToken -> 二进制）
 async function downloadEmbedImage(token, fileToken) {
   const url = 'https://open.feishu.cn/open-apis/drive/v1/medias/' + encodeURIComponent(fileToken) + '/download';
@@ -610,11 +632,12 @@ async function scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnC
   const token = await getValidToken();
   const wantLink = imageSource === 'link' || imageSource === 'both';
   const wantEmbed = imageSource === 'embed' || imageSource === 'both';
-  // 找内嵌图片必须用 Formula 渲染（ToString 只给 {"id":207,"type":"embed-image"}，没有 fileToken）。
-  // Formula 渲染同样能拿到纯文本与公式文本，所以「两者都要」时只读这一遍即可，不会多打 API。
-  const grid = wantEmbed
-    ? await readSheetGridFormula(token, spreadsheetToken, sheetId, rowCount, columnCount)
-    : await readSheetGrid(token, spreadsheetToken, sheetId, rowCount, columnCount);
+  // 统一使用 Formula 渲染，原因有二：
+  //   1) 内嵌图片：ToString 只给 {"id":207,"type":"embed-image"}，没有 fileToken，必须 Formula 才拿得到；
+  //   2) 超链接单元格：单元格显示「10777740685013648_G1_*.jpg」这类裸文件名时，真实 URL 存在
+  //      rich_text[].link 字段里，ToString 会直接丢掉 link，导致纯链接模式扫不到。
+  // Formula 对普通文本单元格的返回与 ToString 等价，所以三种模式都只读这一遍，不会多打 API。
+  const grid = await readSheetGridFormula(token, spreadsheetToken, sheetId, rowCount, columnCount);
   const cells = [];
   for (const [key, value] of grid.entries()) {
     const [rowStr, colStr] = key.split(',');
@@ -638,10 +661,15 @@ async function scanSheet(spreadsheetToken, sheetId, sheetName, rowCount, columnC
     // B) 单元格文本里的图片链接（问卷星 / 表单导出）
     if (!wantLink) continue;
     const text = cellToText(value).trim();
-    if (!text) continue;
     // 1) 先从文本里抽 URL（富文本多链接会被拆成多个）
     let urls = extractUrlsFromCell(text).filter((u) => isImageUrl(u));
-    // 2) 仅当「单元格里明确含 http、但一层没抽到任何可识别的 URL」时，
+    // 2) 抽取单元格 rich_text 里的 hyperlink 字段（关键：解决「显示为文件名，实际是
+    //    超链接」这类 ToString 看不到的链接。典型：10777740685083648_G1_*.jpg 显示在
+    //    单元格里，真实 URL 在 link 字段，需 Formula 渲染才能拿到——目前 grid 已用
+    //    Formula，所以这里是零成本取用）。
+    const linkUrls = cellLinks(value).filter((u) => isImageUrl(u));
+    if (linkUrls.length) urls = [...urls, ...linkUrls];
+    // 3) 仅当「单元格里明确含 http、但前两步都没抽到任何可识别的 URL」时，
     //    才用 Formula/UnformattedValue 渲染兜底（典型场景：超链接公式 =HYPERLINK("url","文字")，
     //    只返回显示文字）。若已经抽到 URL（即使未签名），无需走兜底，避免无关单元格
     //    每格狂打 2 次飞书 API 导致扫描极慢。
@@ -721,14 +749,20 @@ async function downloadImage(inputUrl) {
   let guard = 0;
   while (url.includes('&amp;') && guard++ < 5) url = url.replace(/&amp;/gi, '&');
   // 链接缺少签名参数（Expires/Signature）：说明单元格里存的是不完整的预签名 URL，
-  // 重试/换请求头都无解，直接给出明确提示，避免无意义的重试与 403 堆积
-  if (!/[?&](Expires|Signature)=/.test(url)) {
+  // 重试/换请求头都无解，直接给出明确提示，避免无意义的重试与 403 堆积。
+  // 例外：部分图床不使用预签名，靠 URL 自身即可下载（如 xmplus.cn 的
+  //   /api/survey/files?url=cem/lite/private/xxx.jpg，服务端 302 跳到 assets 域名后返回 200）。
+  //   因此只要 URL 本身看起来就是一张图（路径以图片扩展名结尾，或域名命中图床白名单）就放行。
+  let host = '';
+  try { host = new URL(url).host; } catch (e) { /* ignore */ }
+  const pathNoQuery = (() => { try { return new URL(url).pathname; } catch (e) { return ''; } })();
+  const ext = pathNoQuery.slice(pathNoQuery.lastIndexOf('.') + 1).toLowerCase();
+  const looksLikeImage = IMG_EXT.includes(ext) || IMG_HOST_HINT.some((h) => host.toLowerCase().includes(h));
+  if (!/[?&](Expires|Signature)=/.test(url) && !looksLikeImage) {
     throw new Error('图片链接不完整（缺少 Expires/Signature 签名参数）：单元格里存的 URL 似乎只到 "?" 为止，或签名部分被截断。' +
       '请重新从问卷星/源文件复制【完整】的预签名链接（形如 ...jpg?Expires=...&OSSAccessKeyId=...&Signature=...）粘贴进单元格。' +
       ' || tried=' + url.slice(0, 4000));
   }
-  let host = '';
-  try { host = new URL(url).host; } catch (e) { /* ignore */ }
   const headerSets = [
     {
       'User-Agent': 'Mozilla/5.0 (Windows NT 10.0; Win64; x64) AppleWebKit/537.36 (KHTML, like Gecko) Chrome/120.0.0.0 Safari/537.36',
