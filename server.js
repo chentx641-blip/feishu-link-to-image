@@ -1476,8 +1476,8 @@ const server = http.createServer(async (req, res) => {
         vlReady: !!DASHSCOPE_API_KEY,
         vlModel: DASHSCOPE_API_KEY ? QWEN_VL_MODEL : null,
         extractTypes: EXTRACT_TYPES,
-        version: '3.0',
-        build: '2026-09-10-ui-simple',
+        version: '3.1',
+        build: '2026-09-10-mode-first',
       });
     }
 

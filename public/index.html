@@ -69,23 +69,34 @@
   .tip { font-size: 12px; color: var(--muted); background: #f0f4fb; border-radius: 8px; padding: 10px 12px; margin-top: 10px; }
   .count-badge { display: inline-block; background: var(--primary); color:#fff; border-radius: 999px; padding: 1px 10px; font-size: 12px; margin-left: 6px; }
 
+  /* ---------- 步骤 3：选择功能 ---------- */
+  .mgrid { display: grid; grid-template-columns: repeat(auto-fit, minmax(240px, 1fr)); gap: 12px; }
+  .mcard { border: 1px solid var(--line); border-radius: 10px; padding: 13px 15px; cursor: pointer; transition: .15s; background: #fff; }
+  .mcard:hover { border-color: var(--primary); background: #fafcff; }
+  .mcard.sel-a { border-color: var(--primary); background: #f2f7ff; }
+  .mcard.sel-b { border-color: var(--extract); background: var(--extract-bg); }
+  .mc-head { display: flex; align-items: center; gap: 9px; font-weight: 700; font-size: 14px; }
+  .mc-ico { width: 26px; height: 26px; border-radius: 7px; display: flex; align-items: center; justify-content: center; font-size: 13px; }
+  .mc-desc { font-size: 13px; margin-top: 10px; }
+  .mc-eg { font-size: 11.5px; color: var(--muted); margin-top: 6px; }
+  .mhint { font-size: 12px; color: var(--muted); margin-top: 12px; }
+
+  /* ---------- 常驻：当前功能 ---------- */
+  .modebar { display: flex; align-items: center; gap: 9px; font-size: 13px; background: #eef4ff; border-radius: 10px; padding: 9px 14px; margin-bottom: 12px; }
+  .modebar.b-mode { background: var(--extract-bg); }
+  .mb-ico { width: 22px; height: 22px; border-radius: 6px; display: flex; align-items: center; justify-content: center; font-size: 12px; font-weight: 700; background: #fff; color: var(--primary-d); }
+  .modebar.b-mode .mb-ico { color: var(--extract-d); }
+
   /* ---------- 卡片步骤标题 ---------- */
   .step-head { display: flex; gap: 10px; align-items: center; margin-bottom: 12px; }
   .step-no { flex: 0 0 auto; width: 24px; height: 24px; border-radius: 50%; background: var(--primary); color: #fff; font-size: 13px; font-weight: 700; display: flex; align-items: center; justify-content: center; }
   .step-title { font-weight: 700; font-size: 15px; line-height: 1.4; }
 
-  /* ---------- 预览卡里的两块操作（各做各的）---------- */
+  /* ---------- 结果卡里按功能显示的那一块 ---------- */
   .lane { border: 1px solid var(--line); border-radius: 10px; padding: 14px 16px; margin-top: 14px; background: #fcfdff; }
   .lane-a { border-left: 4px solid var(--primary); }
   .lane-b { border-left: 4px solid var(--extract); background: var(--extract-bg); }
-  .lane-head { font-weight: 700; font-size: 14px; display: flex; align-items: center; gap: 8px; flex-wrap: wrap; }
-  .lane-ico { font-size: 16px; line-height: 1; }
-  .lane-dot { width: 8px; height: 8px; border-radius: 50%; flex: 0 0 auto; }
-  .lane-a .lane-dot { background: var(--primary); }
-  .lane-b .lane-dot { background: var(--extract); }
-  .lane-tag { font-size: 11px; font-weight: 400; color: var(--warn); background: #fff3e8; border-radius: 999px; padding: 1px 8px; }
-  .lane-desc { font-size: 12.5px; color: var(--muted); margin: 6px 0 10px; }
-  .lane-toggle { font-size: 13px; color: var(--text); display: flex; align-items: center; gap: 8px; margin-bottom: 0; }
+  .lane-desc { font-size: 12.5px; color: var(--muted); margin: 0 0 10px; }
   button.btn-extract { background: var(--extract); }
   button.btn-extract:hover { background: var(--extract-d); }
   .vtip { font-size: 12px; color: var(--muted); background: #f0f4fb; border-radius: 8px; padding: 10px 12px; margin-bottom: 8px; }
@@ -148,6 +159,36 @@
     <div class="msg" id="resolveMsg"></div>
   </div>
 
+  <!-- 步骤 3：选择要做什么（解析成功后出现，点一下即进入下一步） -->
+  <div class="card hidden" id="modeCard">
+    <div class="step-head">
+      <span class="step-no">3</span>
+      <div>
+        <div class="step-title">选择要做什么</div>
+      </div>
+    </div>
+    <div class="mgrid">
+      <div class="mcard" id="modeConvert">
+        <div class="mc-head"><span class="mc-ico" style="background:#e8f0ff;color:var(--primary-d);">图</span>链接转图片</div>
+        <div class="mc-desc">把单元格里的网址变成看得见的图片</div>
+        <div class="mc-eg">例：问卷星 / 表单导出的图片链接</div>
+      </div>
+      <div class="mcard" id="modeExtract">
+        <div class="mc-head"><span class="mc-ico" style="background:#f0ecff;color:var(--extract-d);">字</span>图片信息提取</div>
+        <div class="mc-desc">仅限提取 UID / DID / 小红书号 / 手机型号</div>
+        <div class="mc-eg">例：人工粘贴的抖音 / 小红书 / 设置页截图</div>
+      </div>
+    </div>
+    <div class="mhint">两件事都要做？先做一件，做完点「更换」即可，文档和子表会保留。</div>
+  </div>
+
+  <!-- 常驻：当前正在用的功能（走到后面几步也不会忘） -->
+  <div class="modebar hidden" id="modeBar">
+    <span class="mb-ico" id="modeBarIco">图</span>
+    <span>当前功能：<b id="modeBarName">链接转图片</b></span>
+    <button class="ghost" id="changeModeBtn" style="font-size:12px;padding:4px 12px;">更换</button>
+  </div>
+
   <!-- 多维表格模式（粘贴多维表格链接后自动出现） -->
   <div class="card hidden" id="bitableCard">
     <div class="step-head">
@@ -177,10 +218,10 @@
     <div class="tip">从「链接字段」抽网址 → 下载 → 作为附件写入。一个单元格有多个网址就会生成多个附件。</div>
   </div>
 
-  <!-- 步骤 2：选择子表 + 扫描 -->
+  <!-- 步骤 4：选择子表 + 扫描（图片形式只在「图片信息提取」时需要问） -->
   <div class="card hidden" id="sheetCard">
     <div class="step-head">
-      <span class="step-no">3</span>
+      <span class="step-no">4</span>
       <div>
         <div class="step-title">选择子表并扫描</div>
       </div>
@@ -190,7 +231,7 @@
         <label>子表</label>
         <select id="sheetSelect" style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;"></select>
       </div>
-      <div style="flex:1;min-width:250px;">
+      <div style="flex:1;min-width:250px;" id="srcSelectWrap">
         <label>图片形式</label>
         <select id="sourceSelect" style="width:100%;padding:10px 12px;border:1px solid var(--line);border-radius:8px;font-size:14px;">
           <option value="embed">粘贴的截图（内嵌图片）</option>
@@ -223,55 +264,41 @@
       </table>
     </div>
 
-    <!-- 第一件事：链接 → 图片 -->
-    <div class="lane lane-a" id="laneConvert">
-      <div class="lane-head">
-        <span class="lane-ico">🔗</span>把图片链接变成图片
-        <span class="lane-tag">会修改表格</span>
-      </div>
+    <!-- 按第 3 步所选功能，这里只出现对应的那一件事 -->
+    <div class="lane lane-a hidden" id="opConvert">
       <div class="lane-desc">勾选的链接单元格会换成图片，其他单元格不动。</div>
       <div class="row">
         <button id="convertBtn">开始转换</button>
       </div>
     </div>
 
-    <!-- 第二件事：截图 → 文字 -->
-    <div class="lane lane-b">
-      <div class="lane-head">
-        <span class="lane-ico">🔤</span>把截图内容提取成文字
-        <span class="lane-tag">会修改表格</span>
+    <div class="lane lane-b hidden" id="opExtract">
+      <div class="lane-desc">识别截图里的信息，写进下面指定的列。</div>
+      <div class="vtip">
+        已预填常用映射：<b>AE</b>→UID、DID，<b>AF</b>→小红书号，<b>AG</b>→手机型号。通常直接点「开始提取」即可。
       </div>
-      <div class="lane-desc">识别截图里的 UID / DID / 小红书号 / 手机型号，写进指定列。</div>
-
-      <label class="lane-toggle"><input type="checkbox" id="enableExtract" /> 我要提取信息（勾选后展开设置）</label>
-      <div id="vlOff" class="stat hidden" style="margin-top:6px;">服务端未配置视觉识别 Key，提取功能当前不可用。</div>
-
-      <div id="vlCfgWrap" class="hidden" style="margin-top:12px;">
-        <div class="vtip">
-          已预填常用映射：<b>AE</b>→UID、DID，<b>AF</b>→小红书号，<b>AG</b>→手机型号。通常直接点「开始提取」即可。
-        </div>
-        <table>
-          <thead><tr><th style="width:90px;">截图列</th><th style="width:170px;">截图类型</th><th>写入列</th></tr></thead>
-          <tbody id="vlCfgBody"></tbody>
-        </table>
-        <label style="margin-top:10px;display:block;"><input type="checkbox" id="skipFilled" checked /> 跳过目标列已有内容的行</label>
-        <div class="row" style="margin-top:10px;">
-          <button class="btn-extract" id="extractBtn">开始提取</button>
-          <span class="stat" id="vlStat"></span>
-        </div>
+      <table>
+        <thead><tr><th style="width:90px;">截图列</th><th style="width:170px;">截图类型</th><th>写入列</th></tr></thead>
+        <tbody id="vlCfgBody"></tbody>
+      </table>
+      <label style="margin-top:10px;display:block;"><input type="checkbox" id="skipFilled" checked /> 跳过目标列已有内容的行</label>
+      <div id="vlOff" class="stat hidden" style="margin-top:8px;">服务端未配置视觉识别 Key，提取功能当前不可用。</div>
+      <div class="row" style="margin-top:10px;">
+        <button class="btn-extract" id="extractBtn">开始提取</button>
+        <span class="stat" id="vlStat"></span>
       </div>
     </div>
 
     <div class="row" style="margin-top:14px;">
       <button class="ghost" id="rescanBtn">重新扫描</button>
     </div>
-    <div class="tip">⚠️ 两件事都会直接改表，请先核对上方列表。</div>
+    <div class="tip">⚠️ 会直接修改你的飞书表格，请先核对上方列表。</div>
   </div>
 
-  <!-- 步骤 4：进度 -->
+  <!-- 步骤 6：转换进度 -->
   <div class="card hidden" id="jobCard">
     <div class="step-head">
-      <span class="step-no">5</span>
+      <span class="step-no">6</span>
       <div>
         <div class="step-title">转换进度</div>
       </div>
@@ -284,10 +311,10 @@
     </div>
   </div>
 
-  <!-- 步骤 5：智能识别结果预览（确认后才写入） -->
+  <!-- 步骤 6：提取结果预览（确认后才写入） -->
   <div class="card hidden" id="extractCard">
     <div class="step-head">
-      <span class="step-no">5</span>
+      <span class="step-no">6</span>
       <div>
         <div class="step-title">核对后写入</div>
       </div>
@@ -315,6 +342,8 @@ let RESOLVED = null;     // { kind, title, sheets:[...] } 或 { kind:'bitable', 
 let SCAN = null;         // { total, cells:[...] }
 let BT_FIELDS = null;    // 多维表格字段列表 [{field_id, field_name, type}]
 let JOB_TIMER = null;
+let MODE = null;        // 'convert' | 'extract'：第 3 步选定的功能，后续步骤据此裁剪
+let VL_READY = false;   // 服务端是否配置了视觉识别 Key
 
 function show(el){ el.classList.remove('hidden'); }
 function hide(el){ el.classList.add('hidden'); }
@@ -474,9 +503,10 @@ $('resolveBtn').onclick = async () => {
         sel.appendChild(o);
       });
       show($('bitableCard'));
-      hide($('sheetCard')); hide($('previewCard')); hide($('jobCard'));
+      hide($('modeCard')); hide($('modeBar')); hide($('sheetCard'));
+      hide($('previewCard')); hide($('jobCard')); hide($('extractCard'));
     } else {
-      // 电子表格模式（原逻辑）
+      // 电子表格模式：先把子表填好，但顺序上先让用户选功能（步骤 3）
       const sel = $('sheetSelect'); sel.innerHTML = '';
       d.sheets.forEach((s, i) => {
         const o = document.createElement('option');
@@ -486,13 +516,62 @@ $('resolveBtn').onclick = async () => {
       });
       msg.className='msg ok';
       msg.textContent = `解析成功：${d.sheets.length} 个子表` + (d.title ? ` · ${d.title}` : '');
-      show($('sheetCard'));
-      hide($('previewCard')); hide($('jobCard'));
+      resetModeChoice();
+      hide($('bitableCard'));
     }
   } catch(e) {
     msg.className='msg err'; msg.textContent = '请求失败：' + e.message;
   }
 };
+
+// ===== 步骤 3：选择功能（点一下即定型，后面只问该问的）=====
+const MODE_INFO = {
+  convert: { name: '链接转图片',   ico: '图', cls: '',        sel: 'sel-a' },
+  extract: { name: '图片信息提取', ico: '字', cls: 'b-mode',  sel: 'sel-b' },
+};
+
+function paintModeCards() {
+  $('modeConvert').className = 'mcard' + (MODE === 'convert' ? ' sel-a' : '');
+  $('modeExtract').className = 'mcard' + (MODE === 'extract' ? ' sel-b' : '');
+}
+
+// 回到「还没选功能」的状态
+function resetModeChoice() {
+  MODE = null;
+  paintModeCards();
+  hide($('modeBar')); hide($('sheetCard'));
+  hide($('previewCard')); hide($('jobCard')); hide($('extractCard'));
+  show($('modeCard'));
+  SCAN = null;
+}
+
+function chooseMode(m) {
+  MODE = m;
+  paintModeCards();
+  const info = MODE_INFO[m];
+  $('modeBarName').textContent = info.name;
+  $('modeBarIco').textContent = info.ico;
+  $('modeBar').className = 'modebar ' + info.cls;
+  show($('modeBar'));   // 显式取消 hidden，不依赖上面改 className 的副作用
+  // 「链接转图片」处理的必然是链接 → 不再问「图片形式」（也不去改这个下拉，避免切换功能后残留）
+  if (m === 'convert') {
+    hide($('srcSelectWrap'));
+  } else {
+    show($('srcSelectWrap'));
+    $('extractBtn').disabled = !VL_READY;
+    if (VL_READY) hide($('vlOff')); else show($('vlOff'));
+  }
+  hide($('modeCard')); hide($('previewCard')); hide($('jobCard')); hide($('extractCard'));
+  $('scanMsg').textContent = '';
+  show($('sheetCard'));
+  $('sheetCard').scrollIntoView({ behavior: 'smooth', block: 'center' });
+}
+
+$('modeConvert').onclick = () => chooseMode('convert');
+$('modeExtract').onclick = () => chooseMode('extract');
+
+// 更换功能：回到步骤 3，已解析的文档与子表选择都保留
+$('changeModeBtn').onclick = () => resetModeChoice();
 
 // 多维表格：加载字段
 $('btLoadFields').onclick = async () => {
@@ -542,14 +621,17 @@ $('btConvertBtn').onclick = async () => {
 };
 
 $('scanBtn').onclick = async () => {
+  if (!MODE) { alert('请先在第 3 步选择要做什么'); return; }
   const url = $('url').value.trim();
   const sheetId = $('sheetSelect').value;
   const sheet = RESOLVED.sheets.find(s => s.sheet_id === sheetId);
+  // 「链接转图片」只扫链接；「图片信息提取」按用户选的图片形式扫
+  const imageSource = (MODE === 'convert') ? 'link' : ($('sourceSelect') ? $('sourceSelect').value : 'both');
   const msg = $('scanMsg');
   msg.className='msg'; msg.textContent='扫描中（逐块读取整张表）…';
   try {
     const r = await apiFetch('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
-      body: JSON.stringify({spreadsheetToken: RESOLVED.spreadsheetToken, sheetId, sheetName: sheet.sheet_name, rowCount:sheet.row_count, columnCount:sheet.column_count, imageSource: ($('sourceSelect') ? $('sourceSelect').value : 'link')})});
+      body: JSON.stringify({spreadsheetToken: RESOLVED.spreadsheetToken, sheetId, sheetName: sheet.sheet_name, rowCount:sheet.row_count, columnCount:sheet.column_count, imageSource})});
     const d = await r.json();
     if (!d.ok) { msg.className='msg err'; msg.textContent = d.error || '扫描失败'; return; }
     SCAN = d;
@@ -557,7 +639,7 @@ $('scanBtn').onclick = async () => {
     let note = `扫描完成，共发现 ${d.total} 个图片单元格`;
     if (d.embedCount > 0) note += `（其中内嵌图片 ${d.embedCount} 个）`;
     if (d.mergedCount > 0) note += `，其中 ${d.mergedCount} 个含多张图、将自动拼成一张网格图放回原单元格`;
-    if (d.total === 0) note += '。若为 0，请把「图片来源」切换成另一种再试。';
+    if (d.total === 0) note += MODE === 'extract' ? '。若为 0，请把「图片形式」换成另一种再试。' : '。';
     else note += '。';
     msg.className='msg ok'; msg.textContent = note;
     show($('previewCard')); hide($('jobCard'));
@@ -569,10 +651,19 @@ $('scanBtn').onclick = async () => {
 function renderPreview(d) {
   $('scanCount').textContent = d.total;
   $('sheetNameBadge').textContent = $('sheetSelect').value;
-  const srcLabel = { link: '图片链接', embed: '内嵌图片', both: '链接+内嵌' }[d.imageSource || 'link'];
+  const wantExtract = (MODE === 'extract');
+  const srcLabel = wantExtract
+    ? ({ link: '图片链接', embed: '内嵌图片', both: '链接+内嵌' }[d.imageSource || 'both'])
+    : '图片链接';
   $('srcBadge').textContent = srcLabel;
-  // 全是内嵌图片时，图已经在表里了 → 整个「变成图片」分区收起，只留「提取信息」
-  if (d.imageSource === 'embed') { hide($('laneConvert')); } else { show($('laneConvert')); }
+  // 只显示第 3 步所选功能对应的那一件事
+  if (wantExtract) {
+    show($('opExtract')); hide($('opConvert'));
+    buildVlConfig();
+    $('vlStat').textContent = '';
+  } else {
+    show($('opConvert')); hide($('opExtract'));
+  }
   const tb = $('cellTable'); tb.innerHTML = '';
   d.cells.forEach((c, i) => {
     const tr = document.createElement('tr');
@@ -590,8 +681,6 @@ function renderPreview(d) {
     tb.appendChild(tr);
   });
   $('selectAll').checked = true;
-  buildVlConfig();
-  $('vlStat').textContent = '';
 }
 
 $('selectAll').onchange = (e) => {
@@ -707,7 +796,6 @@ function collectMapping() {
   return mapping;
 }
 
-$('enableExtract').onchange = (e) => { if (e.target.checked) show($('vlCfgWrap')); else hide($('vlCfgWrap')); };
 $('exAll').onchange = (e) => { document.querySelectorAll('.exchk').forEach((c) => { c.checked = e.target.checked; }); };
 $('backScanBtn').onclick = () => { hide($('extractCard')); show($('previewCard')); };
 
@@ -826,8 +914,9 @@ $('applyBtn').onclick = async () => {
   try {
     const r = await apiFetch('/api/info');
     const d = await r.json();
-    if (!d.vlReady) {
-      $('enableExtract').disabled = true;
+    VL_READY = !!d.vlReady;
+    if (!VL_READY) {
+      $('extractBtn').disabled = true;
       show($('vlOff'));
     }
   } catch (e) { /* 忽略 */ }
