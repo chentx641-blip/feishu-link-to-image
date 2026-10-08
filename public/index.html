@@ -431,20 +431,48 @@ async function refreshOauthStatus() {
     const d = await r.json();
     const ready = $('adminReady');
     const need = $('adminNeedAuth');
+    const btn = $('oauthStartBtn');
     if (d.tokenReady) {
       // 令牌就绪：折叠管理区，只显示绿色状态条
       show(ready); hide(need);
+      if (btn) btn.textContent = '重新授权';
       $('oauthStatus').textContent = '✓ 授权已就绪';
       $('oauthStatus').style.color = 'var(--ok)';
-    } else {
-      // 未授权：展开管理区，显示按钮
+    } else if (d.expired) {
+      // 有令牌但已失效：必须展开并把原因说清楚
+      //（以前这里只看「有没有令牌」，失效了也显示「已就绪」，导致点什么都报英文错）
       hide(ready); show(need);
+      if (btn) btn.textContent = '重新授权';
+      $('oauthStatus').textContent = '⚠ 授权已过期，需重新授权' + (d.refreshError ? '（' + String(d.refreshError).slice(0, 120) + '）' : '');
+      $('oauthStatus').style.color = 'var(--err)';
+    } else {
+      // 从未授权：展开管理区，显示按钮
+      hide(ready); show(need);
+      if (btn) btn.textContent = '用飞书账号初始化授权';
       $('oauthStatus').textContent = '⚠ 尚未授权（应用创建者需点右侧按钮）';
       $('oauthStatus').style.color = 'var(--warn)';
     }
+    return d;
   } catch (e) {
     /* 网络错误时保持默认（显示 needAuth 区） */
+    return null;
   }
+}
+
+// 任一操作失败后调用：若根因是授权失效，就把「重新授权」入口顶到眼前，
+// 而不是让人对着一句英文报错发愣。返回 true 表示「问题已定位为授权失效」。
+let _authHintShown = false;
+async function hintAuthIfBroken() {
+  const d = await refreshOauthStatus();
+  if (!d || d.tokenReady) return false;
+  if (!_authHintShown) {
+    _authHintShown = true;
+    const card = $('adminCard');
+    if (card) { try { card.scrollIntoView({ behavior: 'smooth', block: 'center' }); } catch (e) {} }
+    const m = $('oauthMsg');
+    if (m) { m.className = 'msg err'; m.textContent = '⚠ 上面那条报错的原因是飞书授权已失效：请先点『重新授权』，完成后再重试。'; }
+  }
+  return true;
 }
 // 展开/折叠：已授权时允许查看详情
 $('adminExpand') && ($('adminExpand').onclick = () => {
@@ -468,9 +496,11 @@ $('oauthStartBtn').onclick = async () => {
         const dd = await rr.json();
         if (dd.tokenReady) {
           clearInterval(timer);
+          _authHintShown = false;                 // 恢复后允许以后再提示
           $('oauthStatus').textContent = '✓ 授权已就绪';
           $('oauthStatus').style.color = 'var(--ok)';
-          msg.textContent = '授权成功，工具已可用。';
+          msg.className = 'msg ok'; msg.textContent = '授权成功，工具已可用。';
+          show($('adminReady')); hide($('adminNeedAuth'));
         }
       } catch (e) {}
       if (tries > 40) { clearInterval(timer); msg.textContent = '授权检测超时，请确认已在飞书完成授权后刷新页面。'; }
@@ -489,7 +519,7 @@ $('resolveBtn').onclick = async () => {
   try {
     const r = await apiFetch('/api/resolve', {method:'POST', headers:{'Content-Type':'application/json'}, body: JSON.stringify({url})});
     const d = await r.json();
-    if (!d.ok) { msg.className='msg err'; msg.textContent = d.error || '解析失败'; return; }
+    if (!d.ok) { msg.className='msg err'; msg.textContent = d.error || '解析失败'; hintAuthIfBroken(); return; }
     RESOLVED = d;
     if (d.kind === 'bitable') {
       // 多维表格模式
@@ -521,6 +551,7 @@ $('resolveBtn').onclick = async () => {
     }
   } catch(e) {
     msg.className='msg err'; msg.textContent = '请求失败：' + e.message;
+    hintAuthIfBroken();
   }
 };
 
@@ -633,7 +664,7 @@ $('scanBtn').onclick = async () => {
     const r = await apiFetch('/api/scan', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({spreadsheetToken: RESOLVED.spreadsheetToken, sheetId, sheetName: sheet.sheet_name, rowCount:sheet.row_count, columnCount:sheet.column_count, imageSource})});
     const d = await r.json();
-    if (!d.ok) { msg.className='msg err'; msg.textContent = d.error || '扫描失败'; return; }
+    if (!d.ok) { msg.className='msg err'; msg.textContent = d.error || '扫描失败'; hintAuthIfBroken(); return; }
     SCAN = d;
     renderPreview(d);
     let note = `扫描完成，共发现 ${d.total} 个图片单元格`;
@@ -645,6 +676,7 @@ $('scanBtn').onclick = async () => {
     show($('previewCard')); hide($('jobCard'));
   } catch(e) {
     msg.className='msg err'; msg.textContent = '请求失败：' + e.message;
+    hintAuthIfBroken();
   }
 };
 
@@ -821,11 +853,13 @@ $('extractBtn').onclick = async () => {
     if (!d.ok) {
       let tip = d.error || '识别启动失败';
       if (d.skippedCount) tip += `\n（已跳过 ${d.skippedCount} 个已有值的单元格）`;
-      alert(tip); $('vlStat').textContent = ''; return;
+      alert(tip); $('vlStat').textContent = '';
+      hintAuthIfBroken();
+      return;
     }
     if (d.skippedCount) $('vlStat').textContent = `已跳过 ${d.skippedCount} 个已有值的单元格`;
     startExtractPolling(d.jobId, d.skippedCount || 0);
-  } catch (e) { alert('请求失败：' + e.message); $('vlStat').textContent = ''; }
+  } catch (e) { alert('请求失败：' + e.message); $('vlStat').textContent = ''; hintAuthIfBroken(); }
 };
 
 function startExtractPolling(jobId, skippedCount) {

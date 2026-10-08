@@ -176,9 +176,22 @@ async function writeDriveToken(t) {
   if (r.code !== 0) throw new Error('写入云空间失败: ' + (r.msg || JSON.stringify(r).slice(0, 200)));
 }
 
+// 最近一次静默刷新的失败原因。
+// 必须记下来：否则刷新失败后只能给使用者一句飞书原文的英文报错，无从下手。
+let lastRefreshError = '';
+// 最近一次刷新失败的时刻。用于冷却：refresh_token 已死时，
+// 不必每次请求都去戳一遍飞书（既慢，又可能触发限流）。
+let refreshFailedAt = 0;
+const REFRESH_COOLDOWN_MS = 60 * 1000;
+
 // 静默刷新（用 refresh_token 换新令牌并持久化）
 async function refreshTokenNow() {
-  if (!tokenStore || !tokenStore.refresh_token) return false;
+  if (refreshFailedAt && Date.now() - refreshFailedAt < REFRESH_COOLDOWN_MS) return false;
+  if (!tokenStore || !tokenStore.refresh_token) {
+    lastRefreshError = '本地没有 refresh_token（从未完成过授权）';
+    refreshFailedAt = Date.now();
+    return false;
+  }
   try {
     const r = await feishuCall('POST', '/open-apis/authen/v2/oauth/token', {
       body: {
@@ -194,10 +207,18 @@ async function refreshTokenNow() {
         refresh_token: r.refresh_token || tokenStore.refresh_token,
         expires_at: Date.now() + (r.expires_in || 7200) * 1000,
       };
+      lastRefreshError = '';
+      refreshFailedAt = 0;
       await persistToken(tokenStore);
       return true;
     }
-  } catch (e) { /* ignore */ }
+    // 飞书返回了业务错误（refresh_token 过期 / 被撤销 / 凭证不匹配…）
+    lastRefreshError = 'code=' + r.code + ' ' + (r.msg || r.error_description || r.error || '');
+  } catch (e) {
+    lastRefreshError = '请求异常：' + ((e && e.message) || String(e));
+  }
+  refreshFailedAt = Date.now();
+  console.log('[token] 静默刷新失败: ' + lastRefreshError);
   return false;
 }
 
@@ -247,7 +268,12 @@ async function bootstrapToken() {
   return tokenStore;
 }
 
-async function saveToken(t) { await persistToken(t); }
+async function saveToken(t) {
+  // 重新授权成功：清掉失败状态与冷却，让服务立刻恢复正常
+  lastRefreshError = '';
+  refreshFailedAt = 0;
+  await persistToken(t);
+}
 
 let oauthState = ''; // 防止 CSRF
 
@@ -333,6 +359,32 @@ async function feishuCallRaw(method, apiPath, { params = null, token = null, con
   return json;
 }
 
+// 令牌「可用性」快照：光有 access_token 不算可用，还要没过期。
+function tokenSnapshot() {
+  const has = !!(tokenStore && tokenStore.access_token);
+  const expired = has && Date.now() >= (tokenStore.expires_at || 0) - 5 * 60 * 1000;
+  return {
+    hasToken: has,
+    expired,
+    usable: has && !expired,
+    refreshError: lastRefreshError,
+    expiresAt: tokenStore ? tokenStore.expires_at : null,
+  };
+}
+
+// 状态查询专用：已过期就顺手试一次静默刷新，据实回报。
+// （否则前端会显示「✓ 已授权」，实际一点就报错——这正是使用者最困惑的情形。）
+async function probeTokenUsable() {
+  await bootstrapToken();
+  const snap = tokenSnapshot();
+  if (snap.usable) return snap;
+  if (snap.hasToken && tokenStore.refresh_token) {
+    await refreshTokenNow();
+    return tokenSnapshot();
+  }
+  return snap;
+}
+
 async function getValidToken() {
   await bootstrapToken();
   if (!tokenStore || !tokenStore.access_token) {
@@ -342,8 +394,15 @@ async function getValidToken() {
   }
   // 提前 5 分钟刷新（内部已自动持久化到本地 + 云空间）
   if (Date.now() >= (tokenStore.expires_at || 0) - 5 * 60 * 1000) {
-    if (tokenStore.refresh_token) {
-      await refreshTokenNow();
+    const ok = tokenStore.refresh_token ? await refreshTokenNow() : false;
+    if (!ok) {
+      // 刷新失败 ⇒ 令牌已不可用。绝不能继续把过期令牌发给飞书：
+      // 那只会换回一句英文的 "Authentication token expired"，使用者完全无从下手。
+      const err = new Error('飞书授权已过期，需要创建者用自己的飞书账号重新授权一次' +
+        '（页面顶部「管理员初始化」→ 点『重新授权』，约 1 分钟）。' +
+        (lastRefreshError ? ' 失败原因：' + lastRefreshError : ''));
+      err.code = 'AUTH_EXPIRED';
+      throw err;
     }
   }
   return tokenStore.access_token;
@@ -1466,18 +1525,20 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && urlp === '/api/info') {
       await bootstrapToken();
+      const ts = tokenSnapshot();
       return sendJSON(res, 200, {
         ok: true,
         gateEnabled: !!ACCESS_CODE,
         appConfigured: !!(FEISHU_APP_ID && FEISHU_APP_SECRET),
-        tokenReady: !!(tokenStore && tokenStore.access_token),
+        tokenReady: ts.usable,
+        tokenExpired: !!(ts.hasToken && !ts.usable),
         sharpReady: (() => { try { getSharp(); return true; } catch (e) { return false; } })(),
         sharpError: (() => { try { getSharp(); return null; } catch (e) { return String(e && e.message || e); } })(),
         vlReady: !!DASHSCOPE_API_KEY,
         vlModel: DASHSCOPE_API_KEY ? QWEN_VL_MODEL : null,
         extractTypes: EXTRACT_TYPES,
-        version: '3.1',
-        build: '2026-09-10-mode-first',
+        version: '3.2',
+        build: '2026-10-08-auth-expiry-guard',
       });
     }
 
@@ -1542,11 +1603,13 @@ const server = http.createServer(async (req, res) => {
 
     if (req.method === 'GET' && urlp === '/api/oauth/status') {
       if (!gateOK(req, res, null)) return;
-      await bootstrapToken();
+      const s = await probeTokenUsable();
       return sendJSON(res, 200, {
         ok: true,
-        tokenReady: !!(tokenStore && tokenStore.access_token),
-        expiresAt: tokenStore ? tokenStore.expires_at : null,
+        tokenReady: s.usable,                            // 只有「真的能用」才算就绪
+        expired: !!(s.hasToken && !s.usable),            // 有令牌但已失效 → 需重新授权
+        refreshError: s.refreshError || null,
+        expiresAt: s.expiresAt,
       });
     }
 
