@@ -738,32 +738,66 @@ $('convertBtn').onclick = async () => {
   } catch(e) { alert('请求失败：' + e.message); }
 };
 
+function fmtMs(ms) {
+  const n = Number(ms) || 0;
+  return n >= 1000 ? (n / 1000).toFixed(1) + 's' : Math.round(n) + 'ms';
+}
+
 function startPolling(jobId) {
   show($('jobCard'));
   hide($('previewCard'));
   const bar = $('bar'); const stat = $('jobStat'); const box = $('jobResults');
   bar.style.width = '0%'; stat.textContent = '开始转换…'; box.innerHTML = '';
   if (JOB_TIMER) clearInterval(JOB_TIMER);
+  let errStreak = 0;
   JOB_TIMER = setInterval(async () => {
     try {
       const r = await apiFetch('/api/job/' + jobId);
       const d = await r.json();
-      if (!d.ok) { stat.textContent = '查询失败'; clearInterval(JOB_TIMER); return; }
+      if (!d.ok) {
+        // 404 / JOB_LOST：服务实例重启，内存里的任务记录没了 —— 重试没意义，要说清楚「表里的图不会丢」
+        if (d.code === 'JOB_LOST' || r.status === 404) {
+          clearInterval(JOB_TIMER);
+          stat.innerHTML = '<b class="res-fail">任务已中断</b>：服务刚重启，进度记录丢失（<b>已经写进表格的图片不会丢</b>）。' +
+            '请点「返回预览」重新转换；已完成的格可先取消勾选，避免重复处理。';
+          return;
+        }
+        // 其它错误（瞬时网络/网关抖动）：先重试，不要一有风吹草动就报「查询失败」
+        errStreak++;
+        if (errStreak <= 5) { stat.textContent = '连接不稳，正在重试（' + errStreak + '/5）…'; return; }
+        clearInterval(JOB_TIMER);
+        stat.textContent = '查询失败：' + (d.error || '未知错误');
+        return;
+      }
+      errStreak = 0;
       const pct = d.total ? Math.round(d.done / d.total * 100) : 0;
       bar.style.width = pct + '%';
-      stat.innerHTML = `已完成 <b>${d.done}</b> / ${d.total} &nbsp;·&nbsp; 状态：${d.status}`;
+      const a = d.active || {};
+      const parts = [];
+      if (a.downloading) parts.push('下载 ' + a.downloading);
+      if (a.composing) parts.push('拼接 ' + a.composing);
+      if (a.uploading) parts.push('写入 ' + a.uploading);
+      const actTxt = parts.length ? ' &nbsp;·&nbsp; 处理中：' + parts.join(' / ') : '';
+      stat.innerHTML = `已完成 <b>${d.done}</b> / ${d.total}${actTxt}` +
+        `<span style="color:#8a94a6;"> &nbsp;·&nbsp; 已用 ${fmtMs(d.elapsedMs)}</span>`;
       if (d.status === 'finished' || d.status === 'error') {
         clearInterval(JOB_TIMER);
-        const okCnt = d.results.filter(x=>x.status==='done').length;
-        const failCnt = d.results.filter(x=>x.status==='failed').length;
-        const mergedCnt = d.results.filter(x=>x.merged).length;
+        const okCnt = d.results.filter(x => x.status === 'done').length;
+        const failCnt = d.results.filter(x => x.status === 'failed').length;
+        const mergedCnt = d.results.filter(x => x.merged).length;
+        const cellTip = (x) => {
+          const t = x.timing || {};
+          return `下载 ${fmtMs(t.download || 0)} / 拼接 ${fmtMs(t.compose || 0)} / 写入 ${fmtMs(t.upload || 0)}`;
+        };
         box.innerHTML = `<div class="stat" style="margin-bottom:6px;">成功 <b class="res-ok">${okCnt}</b> · 失败 <b class="res-fail">${failCnt}</b>` +
-          (mergedCnt ? ` · 其中 <b>${mergedCnt}</b> 个单元格由多图拼成一张` : '') + `</div>` +
-          d.results.map(x => `<div class="stat">${x.range || x.recordId || ''}${x.merged?` <span class="tag" style="background:#eafaf3;color:var(--ok);">${x.mergedSize?`${x.merged}张拼成 · ${x.mergedSize}`:`${x.merged}个附件`}</span>`:''} — <span class="${x.status==='done'?'res-ok':(x.status==='skipped'?'res-ok':'res-fail')}">${x.status==='done'?'✓ 已写入附件':(x.status==='skipped'?'⊘ '+(x.error||'跳过'):('✗ '+ (x.error||'失败')))}</span></div>`).join('');
-        stat.innerHTML += d.status==='finished' ? ' · <b class="res-ok">全部完成</b>' : ' · <b class="res-fail">存在失败</b>';
+          (mergedCnt ? ` · 其中 <b>${mergedCnt}</b> 个单元格由多图拼成一张` : '') +
+          `<span style="color:#8a94a6;"> · 总耗时 ${fmtMs(d.elapsedMs)}</span></div>` +
+          d.results.map(x => `<div class="stat">${x.range || x.recordId || ''}${x.merged ? ` <span class="tag" style="background:#eafaf3;color:var(--ok);">${x.mergedSize ? `${x.merged}张拼成 · ${x.mergedSize}` : `${x.merged}个附件`}</span>` : ''} — <span class="${x.status === 'done' ? 'res-ok' : (x.status === 'skipped' ? 'res-ok' : 'res-fail')}">${x.status === 'done' ? '✓ 已写入附件' : (x.status === 'skipped' ? '⊘ ' + (x.error || '跳过') : ('✗ ' + (x.error || '失败')))}</span>` +
+            (x.ms ? ` <span style="color:#8a94a6;" title="${cellTip(x)}">· ${fmtMs(x.ms)}</span>` : '') + `</div>`).join('');
+        stat.innerHTML += d.status === 'finished' ? ' · <b class="res-ok">全部完成</b>' : ' · <b class="res-fail">存在失败</b>';
       }
-    } catch(e) { /* ignore transient */ }
-  }, 800);
+    } catch (e) { /* 轮询瞬时失败忽略，下一轮继续 */ }
+  }, 1000);
 }
 
 // ---------------------------------------------------------------------------

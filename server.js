@@ -323,7 +323,7 @@ function guessExt(urlStr) {
 // ---------------------------------------------------------------------------
 // 飞书开放 API 调用
 // ---------------------------------------------------------------------------
-async function feishuCall(method, apiPath, { params = null, body = null, token = null } = {}) {
+async function feishuCall(method, apiPath, { params = null, body = null, token = null, timeoutMs = 0 } = {}) {
   let url = 'https://open.feishu.cn' + apiPath;
   if (params) {
     const q = new URLSearchParams(params).toString();
@@ -331,11 +331,15 @@ async function feishuCall(method, apiPath, { params = null, body = null, token =
   }
   const headers = { 'Content-Type': 'application/json; charset=utf-8' };
   if (token) headers['Authorization'] = 'Bearer ' + token;
-  const resp = await fetch(url, {
+  // 必须带超时：没有超时的话，跨境上传大图一旦卡在 TCP 上，任务会永远停在 running，
+  // 前端进度条不动、用户只能等到自己放弃（实测「时间太长」里有一部分就是这么来的）。
+  const opts = {
     method,
     headers,
     body: body ? JSON.stringify(body) : undefined,
-  });
+  };
+  if (timeoutMs > 0) opts.signal = AbortSignal.timeout(timeoutMs);
+  const resp = await fetch(url, opts);
   const text = await resp.text();
   let json;
   try { json = JSON.parse(text); } catch (e) { json = { raw: text }; }
@@ -765,12 +769,30 @@ function logFail(entry) {
     fs.appendFileSync(FLC_LOG_FILE, line);
   } catch (e) { /* 日志写入失败不影响主流程 */ }
 }
+
+// 运行日志（内存环形缓冲 + 控制台 + 落盘）
+// 为什么要有：排查「转换慢 / 卡住 / 查询失败」时，唯一有用的是「每格的下载、拼接、写入各花了多久」。
+// 以前只有失败才落盘，成功路径一片空白，线上出问题只能猜。
+const LOG_RING_MAX = 500;
+const LOG_RING = [];
+function logEvent(obj) {
+  const e = { ts: new Date().toISOString(), ...obj };
+  LOG_RING.push(e);
+  if (LOG_RING.length > LOG_RING_MAX) LOG_RING.shift();
+  try { console.log('[flc] ' + JSON.stringify(e)); } catch (err) { /* ignore */ }
+  // Render 的磁盘是临时的，落盘只为本地/同实例内复盘，不指望长期留存
+  if (obj && (obj.ev === 'cell' || obj.ev === 'job' || obj.kind !== 'ok')) {
+    try { fs.appendFileSync(FLC_LOG_FILE, JSON.stringify(e) + '\n'); } catch (err) { /* ignore */ }
+  }
+}
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
 // 用 Node 内置 http/https 直接发请求（不经过 undici 的 fetch URL 序列化），
 // 拿 pathname+search 原文发出，避免预签名 URL 的查询串被改写导致 OSS 报 SignatureDoesNotMatch。
 // 同时：URL 清洗(&amp;->&、去首尾空格)、手动跟随重定向、403/429/5xx 重试退避。
-function rawGet(url, headers, maxRedirects) {
+function rawGet(url, headers, maxRedirects, opts0) {
+  const idleMs = (opts0 && opts0.idleMs) || 30000;   // 多久没收到数据算卡死
+  const totalMs = (opts0 && opts0.totalMs) || 0;     // 整次下载的总时长上限（0=不限制）
   return new Promise((resolve, reject) => {
     let u;
     try { u = new URL(url); } catch (e) { return reject(e); }
@@ -787,7 +809,7 @@ function rawGet(url, headers, maxRedirects) {
       if ([301, 302, 303, 307, 308].includes(code) && maxRedirects > 0 && res.headers.location) {
         res.resume();
         const next = new URL(res.headers.location, u.href).href;
-        resolve(rawGet(next, headers, maxRedirects - 1));
+        resolve(rawGet(next, headers, maxRedirects - 1, opts0));
         return;
       }
       const chunks = [];
@@ -795,7 +817,16 @@ function rawGet(url, headers, maxRedirects) {
       res.on('end', () => resolve({ status: code, headers: res.headers, buf: Buffer.concat(chunks) }));
     });
     req.on('error', reject);
-    req.setTimeout(30000, () => req.destroy(new Error('下载超时(30s)')));
+    let totalTimer = null;
+    if (totalMs > 0) {
+      totalTimer = setTimeout(() => {
+        req.destroy(new Error('下载超时(总时长>' + Math.round(totalMs / 1000) + 's)'));
+      }, totalMs);
+    }
+    const clearAll = () => { if (totalTimer) { clearTimeout(totalTimer); totalTimer = null; } };
+    req.on('close', clearAll);
+    req.on('error', clearAll);
+    req.setTimeout(idleMs, () => req.destroy(new Error('下载超时(' + Math.round(idleMs / 1000) + 's无数据)')));
     req.end();
   });
 }
@@ -840,13 +871,15 @@ async function downloadImage(inputUrl) {
       'Referer': 'https://www.wjx.cn/',
     },
   ];
-  const MAX = 4;
+  const MAX = 3;
   for (let attempt = 0; attempt < MAX; attempt++) {
     const headers = headerSets[Math.min(attempt, headerSets.length - 1)];
+    const tDl = Date.now();
     try {
-      const { status, headers: rh, buf } = await rawGet(url, headers, 5);
+      const { status, headers: rh, buf } = await rawGet(url, headers, 5, { idleMs: 30000, totalMs: 100000 });
       if (status >= 200 && status < 300) {
         if (buf.length < 50) throw new Error('下载内容过小(' + buf.length + 'B)，可能不是图片');
+        logEvent({ ev: 'download', kind: 'ok', ms: Date.now() - tDl, attempt, bytes: buf.length, host });
         return buf;
       }
       const body = buf.toString('utf8');
@@ -861,6 +894,11 @@ async function downloadImage(inputUrl) {
       throw lastErr;
     } catch (e) {
       lastErr = e;
+      const msg = String((e && e.message) || e);
+      const timedOut = /下载超时/.test(msg);
+      logEvent({ ev: 'download', kind: timedOut ? 'timeout' : 'error', ms: Date.now() - tDl, attempt, msg: msg.slice(0, 160) });
+      // 超时已经等满上限，再重试只会把一格拖到几分钟：只给一次补救机会
+      if (timedOut && attempt >= 1) break;
       // 网络层异常（DNS/TLS/超时）也重试
       await sleep(800 * Math.pow(2, attempt));
     }
@@ -1029,22 +1067,33 @@ async function composeImages(buffers) {
     const totalPx = metas.reduce((a, m) => a + m.w * m.h, 0);
     const baseScale = totalPx > MERGE_MAX_PIXELS ? Math.sqrt(MERGE_MAX_PIXELS / totalPx) : 1;
 
+    // 缩放后中间图的缓存：如果 PNG 试完体积超标要回落 JPEG，直接复用同一批缩放结果，
+    // 不必把「解码 + Lanczos 重采样」白跑第二遍（超长图这一遍就是好几秒）。
+    let preparedCache = null;
+
     const render = async (sc, asJpeg) => {
-      const prepared = [];
-      for (let i = 0; i < buffers.length; i++) {
-        const { w, h } = metas[i];
-        const tw = Math.max(1, Math.round(w * sc));
-        const th = Math.max(1, Math.round(h * sc));
-        if (sc >= 0.999) {
-          // 不需缩小：原图 buffer 直接当合成输入，不重编码 → 画质零损失
-          prepared.push({ buf: buffers[i], tw: w, th: h });
-        } else {
-          const p = S(buffers[i], { failOn: 'none', unlimited: true }).resize(tw, th, { fit: 'fill' });
-          const buf = asJpeg
-            ? await p.jpeg({ quality: 92, chromaSubsampling: '4:4:4' }).toBuffer()
-            : await p.png({ compressionLevel: 9 }).toBuffer();
-          prepared.push({ buf, tw, th });
+      let prepared;
+      if (preparedCache && preparedCache.sc === sc) {
+        prepared = preparedCache.items;
+      } else {
+        prepared = [];
+        for (let i = 0; i < buffers.length; i++) {
+          const { w, h } = metas[i];
+          const tw = Math.max(1, Math.round(w * sc));
+          const th = Math.max(1, Math.round(h * sc));
+          if (sc >= 0.999) {
+            // 不需缩小：原图 buffer 直接当合成输入，不重编码 → 画质零损失
+            prepared.push({ buf: buffers[i], tw, th });
+          } else {
+            // 中间图用 PNG(level 1)：无损、编码极快，只是给画布合成当输入，不产出成品
+            const buf = await S(buffers[i], { failOn: 'none', unlimited: true })
+              .resize(tw, th, { fit: 'fill' })
+              .png({ compressionLevel: 1 })
+              .toBuffer();
+            prepared.push({ buf, tw, th });
+          }
         }
+        preparedCache = { sc, items: prepared };
       }
       const n = prepared.length;
       const cols = Math.max(1, Math.ceil(Math.sqrt(n))); // 2 张→并排，4 张→2×2
@@ -1074,18 +1123,22 @@ async function composeImages(buffers) {
       }).composite(composites);
       const buf = asJpeg
         ? await canvas.jpeg({ quality: 92, chromaSubsampling: '4:4:4' }).toBuffer()
-        : await canvas.png({ compressionLevel: 9 }).toBuffer();
+        // PNG 压缩级别 9→6：PNG 是无损格式，级别只影响压缩耗时/体积，像素完全相同。
+        // 实测 1506x13632 长截图：level 9 需 1.66s、level 6 仅 0.37s，体积 0.16→0.23MB。
+        // 为几十 KB 体积多烧 4 倍 CPU，在这种「用户现场等结果」的场景完全不划算。
+        : await canvas.png({ compressionLevel: 6 }).toBuffer();
       return { buf, width: gridW, height: gridH };
     };
 
-    // 1) 先按预算出 PNG（截图为文字图形，PNG 无损最清晰）
+    // 1) 先试 PNG（截图以文字为主，PNG 无损最清晰）。画质策略与之前完全一致，不动。
     let sc = baseScale;
     let out = await render(sc, false);
     if (out.buf.length <= MERGE_MAX_BYTES) {
       console.log(`[compose] n=${buffers.length} scale=${sc.toFixed(3)} ${out.width}x${out.height} ${(out.buf.length / 1048576).toFixed(1)}MB png`);
       return { buf: out.buf, ext: '.png', width: out.width, height: out.height, scale: sc };
     }
-    // 2) PNG 太大（长截图里带照片时常见）→ 换 JPEG q92 4:4:4，分辨率不动
+    // 2) PNG 太大（长截图里带照片时常见）→ 换 JPEG q92 4:4:4，分辨率不动。
+    //    复用上面已缩放好的中间图，不会重复解码 + 重采样。
     out = await render(sc, true);
     if (out.buf.length <= MERGE_MAX_BYTES) {
       console.log(`[compose] n=${buffers.length} scale=${sc.toFixed(3)} ${out.width}x${out.height} ${(out.buf.length / 1048576).toFixed(1)}MB jpg(体积回落)`);
@@ -1249,59 +1302,175 @@ async function startBitableJob(appToken, tableId, linkField, attachField, overwr
 }
 
 // ---------------------------------------------------------------------------
-// 转换：逐格下载图片并写入单元格（异步任务）
+// 转换：流水线（下载 / 拼接 / 写回 三段各自限流并发）
 // ---------------------------------------------------------------------------
+// 为什么必须并发：原来是「一格接一格」串行，每格耗时 = 下载 + 拼接 + 写回 三段相加。
+// 但这三段基本都是网络等待（跨境拉原图、把 base64 推给飞书），CPU 只在拼接那 1~3 秒忙。
+// 串行等于让带宽和 CPU 互相干等：10 格各 15s 就是 150s。
+// 改成流水线后总时长≈max(下载÷下载并发, 拼接串行总量, 写回÷写回并发)，实测可压到 1/3 左右。
+// 三段并发度分开设，因为它们争的不是同一种资源：
+//   下载 = 纯带宽，可以放开（默认 4）
+//   拼接 = 纯内存（20MP 画布 RGBA 就是 80MB），Render 免费实例 512MB，必须压到 1
+//   写回 = 受飞书接口 QPS 限制，默认 3
+const MERGE_DL_CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.MERGE_DL_CONCURRENCY || 4)));
+const MERGE_COMPOSE_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.MERGE_COMPOSE_CONCURRENCY || 1)));
+const MERGE_UPLOAD_CONCURRENCY = Math.max(1, Math.min(6, Number(process.env.MERGE_UPLOAD_CONCURRENCY || 3)));
+// 「同时在处理的单元格」上限。不加这个，一次勾 20 格会让 20 张原图同时躺在内存里排队等拼接：
+// 超长截图原图动辄十几 MB，500MB 的免费实例很容易被撑爆 → 进程被杀 → 任务全丢（前端就显示「查询失败」）。
+const MERGE_CELL_CONCURRENCY = Math.max(1, Math.min(12, Number(process.env.MERGE_CELL_CONCURRENCY || 4)));
+
+// 极简信号量：acquire/release 成对使用
+function semaphore(max) {
+  let active = 0;
+  const waiters = [];
+  return {
+    acquire() {
+      if (active < max) { active++; return Promise.resolve(); }
+      return new Promise((resolve) => waiters.push(resolve));
+    },
+    release() {
+      const next = waiters.shift();
+      if (next) next(); // 名额直接移交给排队者，active 保持不变
+      else active--;
+    },
+  };
+}
+
 const jobs = new Map();
 let seq = 1;
 
 function startJob(spreadsheetToken, sheetId, sheetName, cells) {
   const id = String(seq++);
-  const job = { id, status: 'running', total: cells.length, done: 0, results: [], startedAt: Date.now() };
+  const job = {
+    id, status: 'running', total: cells.length, done: 0,
+    // 按下标占位：并发完成后到达顺序会乱，但前端展示顺序保持与预览一致
+    results: new Array(cells.length),
+    startedAt: Date.now(), heartbeat: Date.now(), failCount: 0,
+    active: { downloading: 0, composing: 0, uploading: 0 },
+  };
   jobs.set(id, job);
+  const dlSem = semaphore(MERGE_DL_CONCURRENCY);
+  const cpSem = semaphore(MERGE_COMPOSE_CONCURRENCY);
+  const upSem = semaphore(MERGE_UPLOAD_CONCURRENCY);
+  const cellSem = semaphore(MERGE_CELL_CONCURRENCY);
+
   (async () => {
+    let token;
     try {
-      const token = await getValidToken();
-      for (const c of cells) {
-        const r = { range: c.range, source: c.source, status: 'pending', imageCount: c.imageCount || 1 };
+      token = await getValidToken();
+    } catch (e) {
+      job.status = 'error';
+      job.error = String((e && e.message) || e);
+      logEvent({ ev: 'job', jobId: id, kind: 'error', msg: job.error.slice(0, 200), ms: 0 });
+      return;
+    }
+    logEvent({ ev: 'job', jobId: id, kind: 'start', cells: cells.length, sheet: sheetName });
+
+    const runCell = async (c, idx) => {
+      await cellSem.acquire(); // 限制同时在途的格数，防止大量原图同时占内存
+      const tAll = Date.now();
+      const timing = {};
+      const r = { range: c.range, source: c.source, status: 'pending', imageCount: c.imageCount || 1, stage: 'queued' };
+      job.results[idx] = r;
+      try {
+        const urls = (Array.isArray(c.urls) && c.urls.length > 0) ? c.urls : (c.url ? [c.url] : []);
+        if (urls.length === 0) throw new Error('该单元格没有可用链接');
+
+        // ---- 段1：下载（同格多图并发，每张占一个带宽名额）----
+        r.stage = 'downloading';
+        job.active.downloading++;
+        const tDl = Date.now();
+        let bufs;
         try {
-          let base64, ext;
-          if (c.urls && c.urls.length > 1) {
-            // 一格多图：先逐张下载，再拼成一张网格图写回原单元格
-            const bufs = [];
-            for (const u of c.urls) bufs.push(await downloadImage(u));
-            const merged = await composeImages(bufs);
-            base64 = merged.buf.toString('base64');
-            ext = merged.ext;
+          bufs = await Promise.all(urls.map(async (u) => {
+            await dlSem.acquire();
+            try { return await downloadImage(u); } finally { dlSem.release(); }
+          }));
+        } finally {
+          job.active.downloading--;
+          timing.download = Date.now() - tDl;
+        }
+
+        // ---- 段2：拼接（仅一格多图；独占内存，串行）----
+        let buf, ext;
+        if (bufs.length > 1) {
+          r.stage = 'composing';
+          job.active.composing++;
+          const tCp = Date.now();
+          try {
+            await cpSem.acquire();
+            let merged;
+            try { merged = await composeImages(bufs); } finally { cpSem.release(); }
+            buf = merged.buf; ext = merged.ext;
             r.mergedSize = merged.width + 'x' + merged.height;
             r.mergedScale = Number(merged.scale.toFixed(3));
-          } else {
-            const buf = await downloadImage(c.url);
-            ext = guessExt(c.url);
-            base64 = buf.toString('base64');
+            r.mergedBytes = merged.buf.length;
+          } finally {
+            job.active.composing--;
+            timing.compose = Date.now() - tCp;
           }
-          const range = `${sheetId}!${c.range}:${c.range}`;
-          const wr = await feishuCall('POST',
-            '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values_image',
-            { body: { range, image: base64, name: 'flc' + ext }, token });
-          if (wr.code === 0) {
-            r.status = 'done';
-            if (c.urls && c.urls.length > 1) r.merged = c.urls.length; // 标记：本格由 N 张拼成
-          } else {
-            r.status = 'failed';
-            r.error = '写入图片失败：' + (wr.msg || JSON.stringify(wr).slice(0, 200));
-          }
-        } catch (e) {
-          r.status = 'failed';
-          r.error = String(e.message || e).slice(0, 300);
+        } else {
+          buf = bufs[0];
+          ext = guessExt(urls[0]);
+          r.bytes = buf.length;
         }
+
+        // ---- 段3：写回（base64 推飞书，最容易被跨境网络拖住的一段）----
+        r.stage = 'uploading';
+        job.active.uploading++;
+        const tUp = Date.now();
+        let wr;
+        try {
+          await upSem.acquire();
+          try {
+            wr = await feishuCall('POST',
+              '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values_image',
+              {
+                body: { range: `${sheetId}!${c.range}:${c.range}`, image: buf.toString('base64'), name: 'flc' + ext },
+                token,
+                timeoutMs: 180000, // 大图跨境上传给足 3 分钟，但必须有上限
+              });
+          } finally { upSem.release(); }
+        } finally {
+          job.active.uploading--;
+          timing.upload = Date.now() - tUp;
+        }
+
+        if (wr && wr.code === 0) {
+          r.status = 'done';
+          if (bufs.length > 1) r.merged = bufs.length; // 标记：本格由 N 张拼成
+        } else {
+          r.status = 'failed';
+          r.error = '写入图片失败：' + ((wr && wr.msg) || JSON.stringify(wr || {}).slice(0, 200));
+        }
+      } catch (e) {
+        r.status = 'failed';
+        r.error = String((e && e.message) || e).slice(0, 300);
+      } finally {
+        r.stage = r.status === 'failed' ? 'failed' : 'done';
+        r.ms = Date.now() - tAll;
+        r.timing = timing;
+        if (r.status === 'failed') job.failCount++;
         job.done++;
-        job.results.push(r);
+        job.heartbeat = Date.now();
+        logEvent({
+          ev: 'cell', jobId: id, range: r.range, status: r.status,
+          downloadMs: timing.download || 0, composeMs: timing.compose || 0, uploadMs: timing.upload || 0,
+          totalMs: r.ms, bytes: r.mergedBytes || r.bytes || null, dims: r.mergedSize || null,
+          err: r.status === 'failed' ? String(r.error || '').slice(0, 160) : undefined,
+        });
+        cellSem.release();
       }
+    };
+
+    try {
+      await Promise.all(cells.map((c, i) => runCell(c, i)));
       job.status = 'finished';
     } catch (e) {
       job.status = 'error';
-      job.error = String(e.message || e);
+      job.error = String((e && e.message) || e);
     }
+    logEvent({ ev: 'job', jobId: id, kind: job.status, cells: cells.length, failCount: job.failCount, ms: Date.now() - job.startedAt });
   })();
   return job;
 }
@@ -1598,9 +1767,12 @@ const server = http.createServer(async (req, res) => {
         vlReady: !!DASHSCOPE_API_KEY,
         vlModel: DASHSCOPE_API_KEY ? QWEN_VL_MODEL : null,
         extractTypes: EXTRACT_TYPES,
-        mergePolicy: { maxPixels: MERGE_MAX_PIXELS, maxBytes: MERGE_MAX_BYTES },
-        version: '3.3',
-        build: '2026-10-22-merge-hires',
+        mergePolicy: {
+          maxPixels: MERGE_MAX_PIXELS, maxBytes: MERGE_MAX_BYTES, pngLevel: 6,
+          concurrency: { cell: MERGE_CELL_CONCURRENCY, download: MERGE_DL_CONCURRENCY, compose: MERGE_COMPOSE_CONCURRENCY, upload: MERGE_UPLOAD_CONCURRENCY },
+        },
+        version: '3.4',
+        build: '2026-10-22-pipeline-concurrency',
       });
     }
 
@@ -1853,11 +2025,24 @@ const server = http.createServer(async (req, res) => {
       if (!gateOK(req, res, null)) return;
       const id = urlp.slice('/api/job/'.length);
       const job = jobs.get(id);
-      if (!job) return sendJSON(res, 404, { ok: false, error: '任务不存在' });
+      // 任务只存在内存里：Render 免费实例一旦重启/被回收，进度就没了。
+      // 带上 code 让前端能区分「任务丢了」和「口令/网络错误」，给出不同的提示。
+      if (!job) return sendJSON(res, 404, { ok: false, code: 'JOB_LOST', error: '任务不存在（服务可能已重启，进度无法恢复）' });
       return sendJSON(res, 200, {
         ok: true, id: job.id, status: job.status, total: job.total, done: job.done,
-        results: job.results, error: job.error || null,
+        results: job.results.filter(Boolean), error: job.error || null,
+        elapsedMs: Date.now() - job.startedAt,
+        failCount: job.failCount || 0,
+        active: job.active,
       });
+    }
+
+    // 诊断日志（管理员）：最近若干条下载/拼接/写入事件，含各段耗时。
+    // 之前排查「转换慢」只能靠猜，就是因为成功路径没有任何记录。
+    if (req.method === 'GET' && urlp === '/api/logs') {
+      if (!adminGateOK(req, res, null)) return;
+      const n = Math.max(1, Math.min(LOG_RING_MAX, Number(q.get('n') || 200)));
+      return sendJSON(res, 200, { ok: true, total: LOG_RING.length, logs: LOG_RING.slice(-n) });
     }
 
     res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
