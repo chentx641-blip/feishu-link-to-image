@@ -1002,62 +1002,120 @@ async function decodeImage(buf) {
     throw new Error('当前部署环境未安装 sharp 依赖，无法解码非 PNG 图片（JPEG/WEBP 需要 sharp）：' + se.message);
   }
 }
+// 拼接策略（2026-10-22 重写，修复「一格多图拼完变糊」）：
+//   旧做法把每张图的「最长边」硬压到 1080。手机长截图宽高比常见 1:6~1:19，
+//   一张 1080×20000 的长截图会被压成 58×1080；两张并排后画布只有 252×1104，
+//   写进表里必然糊成一团（用户实测复现：输出 252×1104）。
+//   新做法改为「总像素预算」：
+//     · 总和没超预算 → 完全不缩放，原图直接进画布（连一次重编码都不做，零损失）；
+//     · 超预算 → 所有图按同一个系数等比缩，保证多张之间相对大小不变；
+//     · 再加体积保险：PNG 超上限就换 JPEG(q92, 4:4:4)，仍超才逐步降分辨率——
+//       宁可先降编码质量，也不先降分辨率，因为糊的主因就是分辨率被砍。
+const MERGE_MAX_PIXELS = Math.max(1000000, Number(process.env.MERGE_MAX_PIXELS || 20000000));
+const MERGE_MAX_BYTES = Math.max(500000, Number(process.env.MERGE_MAX_BYTES || 8 * 1024 * 1024));
+
 async function composeImages(buffers) {
-  const THUMB = 1080; // 每张缩略图最长边上限（px）。整条链路走 sharp 高质量 Lanczos 缩放，不再丢细节
-  const PAD = 12;     // 网格间距（px）
+  const PAD = 12; // 网格间距（px）
 
   // 主路径：sharp 全程（高质量解码 + Lanczos 缩小 + 高质量合成），PNG/JPEG/WEBP 全支持
   try {
     const S = getSharp();
-    const prepared = [];
+    // 先只读尺寸，用来算统一缩放系数（不预先解码像素，长截图也不吃内存）
+    const metas = [];
     for (const b of buffers) {
-      const meta = await S(b, { failOn: 'none', unlimited: true }).metadata();
-      const w = meta.width || THUMB, h = meta.height || THUMB;
-      const scale = Math.min(1, THUMB / Math.max(w, h));
-      const tw = Math.max(1, Math.round(w * scale));
-      const th = Math.max(1, Math.round(h * scale));
-      // sharp 默认 Lanczos3 滤波缩小，文字/细节不会糊
-      const buf = await S(b, { failOn: 'none', unlimited: true })
-        .resize(tw, th, { fit: 'fill' })
-        .png()
-        .toBuffer();
-      prepared.push({ buf, tw, th });
+      const m = await S(b, { failOn: 'none', unlimited: true }).metadata();
+      metas.push({ w: Math.max(1, m.width || 1), h: Math.max(1, m.height || 1) });
     }
-    const n = prepared.length;
-    const cols = Math.max(1, Math.ceil(Math.sqrt(n))); // 2~3 列
-    const rows = Math.ceil(n / cols);
-    const colW = new Array(cols).fill(0);
-    const rowH = new Array(rows).fill(0);
-    prepared.forEach((im, i) => {
-      const c = i % cols, r = Math.floor(i / cols);
-      colW[c] = Math.max(colW[c], im.tw);
-      rowH[r] = Math.max(rowH[r], im.th);
-    });
-    const gridW = colW.reduce((a, b) => a + b, 0) + PAD * (cols + 1);
-    const gridH = rowH.reduce((a, b) => a + b, 0) + PAD * (rows + 1);
-    const composites = [];
-    let x = PAD;
-    for (let c = 0; c < cols; c++) {
-      let y = PAD;
-      for (let r = 0; r < rows; r++) {
-        const i = r * cols + c;
-        if (i < n) composites.push({ input: prepared[i].buf, left: x, top: y });
-        y += rowH[r] + PAD;
+    const totalPx = metas.reduce((a, m) => a + m.w * m.h, 0);
+    const baseScale = totalPx > MERGE_MAX_PIXELS ? Math.sqrt(MERGE_MAX_PIXELS / totalPx) : 1;
+
+    const render = async (sc, asJpeg) => {
+      const prepared = [];
+      for (let i = 0; i < buffers.length; i++) {
+        const { w, h } = metas[i];
+        const tw = Math.max(1, Math.round(w * sc));
+        const th = Math.max(1, Math.round(h * sc));
+        if (sc >= 0.999) {
+          // 不需缩小：原图 buffer 直接当合成输入，不重编码 → 画质零损失
+          prepared.push({ buf: buffers[i], tw: w, th: h });
+        } else {
+          const p = S(buffers[i], { failOn: 'none', unlimited: true }).resize(tw, th, { fit: 'fill' });
+          const buf = asJpeg
+            ? await p.jpeg({ quality: 92, chromaSubsampling: '4:4:4' }).toBuffer()
+            : await p.png({ compressionLevel: 9 }).toBuffer();
+          prepared.push({ buf, tw, th });
+        }
       }
-      x += colW[c] + PAD;
+      const n = prepared.length;
+      const cols = Math.max(1, Math.ceil(Math.sqrt(n))); // 2 张→并排，4 张→2×2
+      const rows = Math.ceil(n / cols);
+      const colW = new Array(cols).fill(0);
+      const rowH = new Array(rows).fill(0);
+      prepared.forEach((im, i) => {
+        const c = i % cols, r = Math.floor(i / cols);
+        colW[c] = Math.max(colW[c], im.tw);
+        rowH[r] = Math.max(rowH[r], im.th);
+      });
+      const gridW = colW.reduce((a, b) => a + b, 0) + PAD * (cols + 1);
+      const gridH = rowH.reduce((a, b) => a + b, 0) + PAD * (rows + 1);
+      const composites = [];
+      let x = PAD;
+      for (let c = 0; c < cols; c++) {
+        let y = PAD;
+        for (let r = 0; r < rows; r++) {
+          const i = r * cols + c;
+          if (i < n) composites.push({ input: prepared[i].buf, left: x, top: y });
+          y += rowH[r] + PAD;
+        }
+        x += colW[c] + PAD;
+      }
+      const canvas = S({
+        create: { width: gridW, height: gridH, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } },
+      }).composite(composites);
+      const buf = asJpeg
+        ? await canvas.jpeg({ quality: 92, chromaSubsampling: '4:4:4' }).toBuffer()
+        : await canvas.png({ compressionLevel: 9 }).toBuffer();
+      return { buf, width: gridW, height: gridH };
+    };
+
+    // 1) 先按预算出 PNG（截图为文字图形，PNG 无损最清晰）
+    let sc = baseScale;
+    let out = await render(sc, false);
+    if (out.buf.length <= MERGE_MAX_BYTES) {
+      console.log(`[compose] n=${buffers.length} scale=${sc.toFixed(3)} ${out.width}x${out.height} ${(out.buf.length / 1048576).toFixed(1)}MB png`);
+      return { buf: out.buf, ext: '.png', width: out.width, height: out.height, scale: sc };
     }
-    return await S({
-      create: { width: gridW, height: gridH, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } },
-    }).composite(composites).png().toBuffer();
+    // 2) PNG 太大（长截图里带照片时常见）→ 换 JPEG q92 4:4:4，分辨率不动
+    out = await render(sc, true);
+    if (out.buf.length <= MERGE_MAX_BYTES) {
+      console.log(`[compose] n=${buffers.length} scale=${sc.toFixed(3)} ${out.width}x${out.height} ${(out.buf.length / 1048576).toFixed(1)}MB jpg(体积回落)`);
+      return { buf: out.buf, ext: '.jpg', width: out.width, height: out.height, scale: sc };
+    }
+    // 3) 仍太大 → 才逐步降分辨率（每次 ×0.8，最多 4 轮）
+    for (let i = 0; i < 4; i++) {
+      sc *= 0.8;
+      out = await render(sc, true);
+      if (out.buf.length <= MERGE_MAX_BYTES) {
+        console.log(`[compose] n=${buffers.length} scale=${sc.toFixed(3)} ${out.width}x${out.height} ${(out.buf.length / 1048576).toFixed(1)}MB jpg(降分辨率第${i + 1}轮)`);
+        return { buf: out.buf, ext: '.jpg', width: out.width, height: out.height, scale: sc };
+      }
+    }
+    // 兜底：取最后一轮结果（宁可稍大也不失败）
+    console.log(`[compose] 体积仍未达上限，使用最后一轮结果 ${out.width}x${out.height} ${(out.buf.length / 1048576).toFixed(1)}MB`);
+    return { buf: out.buf, ext: '.jpg', width: out.width, height: out.height, scale: sc };
   } catch (se) {
     // 兜底（仅当 sharp 缺失时）：纯 JS 8-bit PNG 解码 + 最近邻缩小 + 合成。清晰度较差但保证可用。
+    // 必须打日志：这条分支一旦被走到，画质会明显下降，静默兜底等于把问题藏起来。
+    console.error('[compose] sharp 路径失败，改用纯 JS 兜底（画质会下降）: ' + ((se && se.message) || se));
     const prepared = [];
-    for (const b of buffers) {
-      const img = await decodeImage(b);
-      const scale = Math.min(1, THUMB / Math.max(img.width, img.height));
-      const tw = Math.max(1, Math.round(img.width * scale));
-      const th = Math.max(1, Math.round(img.height * scale));
-      prepared.push({ data: resizeRGBA(img.data, img.width, img.height, tw, th), tw, th });
+    for (const b of buffers) prepared.push(await decodeImage(b));
+    const totalPx = prepared.reduce((a, im) => a + im.width * im.height, 0);
+    const sc = totalPx > MERGE_MAX_PIXELS ? Math.sqrt(MERGE_MAX_PIXELS / totalPx) : 1;
+    for (let i = 0; i < prepared.length; i++) {
+      const img = prepared[i];
+      const tw = Math.max(1, Math.round(img.width * sc));
+      const th = Math.max(1, Math.round(img.height * sc));
+      prepared[i] = { data: resizeRGBA(img.data, img.width, img.height, tw, th), tw, th };
     }
     const n = prepared.length;
     const cols = Math.max(1, Math.ceil(Math.sqrt(n)));
@@ -1092,7 +1150,8 @@ async function composeImages(buffers) {
       }
       x += colW[c] + PAD;
     }
-    return pngEncodeRGBA(gridW, gridH, canvas);
+    console.log(`[compose] sharp 不可用，走纯 JS 兜底 n=${buffers.length} ${gridW}x${gridH}`);
+    return { buf: pngEncodeRGBA(gridW, gridH, canvas), ext: '.png', width: gridW, height: gridH, scale: sc };
   }
 }
 
@@ -1211,8 +1270,10 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
             const bufs = [];
             for (const u of c.urls) bufs.push(await downloadImage(u));
             const merged = await composeImages(bufs);
-            base64 = merged.toString('base64');
-            ext = '.png';
+            base64 = merged.buf.toString('base64');
+            ext = merged.ext;
+            r.mergedSize = merged.width + 'x' + merged.height;
+            r.mergedScale = Number(merged.scale.toFixed(3));
           } else {
             const buf = await downloadImage(c.url);
             ext = guessExt(c.url);
@@ -1537,8 +1598,9 @@ const server = http.createServer(async (req, res) => {
         vlReady: !!DASHSCOPE_API_KEY,
         vlModel: DASHSCOPE_API_KEY ? QWEN_VL_MODEL : null,
         extractTypes: EXTRACT_TYPES,
-        version: '3.2',
-        build: '2026-10-08-auth-expiry-guard',
+        mergePolicy: { maxPixels: MERGE_MAX_PIXELS, maxBytes: MERGE_MAX_BYTES },
+        version: '3.3',
+        build: '2026-10-22-merge-hires',
       });
     }
 

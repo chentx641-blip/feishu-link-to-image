@@ -759,7 +759,7 @@ function startPolling(jobId) {
         const mergedCnt = d.results.filter(x=>x.merged).length;
         box.innerHTML = `<div class="stat" style="margin-bottom:6px;">成功 <b class="res-ok">${okCnt}</b> · 失败 <b class="res-fail">${failCnt}</b>` +
           (mergedCnt ? ` · 其中 <b>${mergedCnt}</b> 个单元格由多图拼成一张` : '') + `</div>` +
-          d.results.map(x => `<div class="stat">${x.range || x.recordId || ''}${x.merged?` <span class="tag" style="background:#eafaf3;color:var(--ok);">${x.merged}个附件</span>`:''} — <span class="${x.status==='done'?'res-ok':(x.status==='skipped'?'res-ok':'res-fail')}">${x.status==='done'?'✓ 已写入附件':(x.status==='skipped'?'⊘ '+(x.error||'跳过'):('✗ '+ (x.error||'失败')))}</span></div>`).join('');
+          d.results.map(x => `<div class="stat">${x.range || x.recordId || ''}${x.merged?` <span class="tag" style="background:#eafaf3;color:var(--ok);">${x.mergedSize?`${x.merged}张拼成 · ${x.mergedSize}`:`${x.merged}个附件`}</span>`:''} — <span class="${x.status==='done'?'res-ok':(x.status==='skipped'?'res-ok':'res-fail')}">${x.status==='done'?'✓ 已写入附件':(x.status==='skipped'?'⊘ '+(x.error||'跳过'):('✗ '+ (x.error||'失败')))}</span></div>`).join('');
         stat.innerHTML += d.status==='finished' ? ' · <b class="res-ok">全部完成</b>' : ' · <b class="res-fail">存在失败</b>';
       }
     } catch(e) { /* ignore transient */ }
