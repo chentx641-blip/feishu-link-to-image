@@ -723,15 +723,20 @@ $('rescanBtn').onclick = () => { hide($('previewCard')); $('scanMsg').textConten
 // 转换做完后允许回到预览，接着做「提取信息」（两件事互不影响，可先后做）
 $('backFromJobBtn').onclick = () => { hide($('jobCard')); show($('previewCard')); };
 
+// 记住本次提交的单元格，供「只重试失败的那几格」复用，避免为几个失败格把成功格全部重跑
+let LAST_CONVERT = null;
+
 $('convertBtn').onclick = async () => {
   const sheetId = $('sheetSelect').value;
   const sheet = RESOLVED.sheets.find(s => s.sheet_id === sheetId);
   const chosen = SCAN.cells.filter((_, i) => document.querySelector(`.cellchk[data-i="${i}"]`).checked);
   if (chosen.length === 0) { alert('请至少选择一个单元格'); return; }
+  const payload = chosen.map(c=>({range:c.range, urls:c.urls, url:c.url, source:c.source, imageCount:c.imageCount}));
+  LAST_CONVERT = { sheetId, sheetName: sheet.sheet_name, cells: payload };
   try {
     const r = await apiFetch('/api/convert', {method:'POST', headers:{'Content-Type':'application/json'},
       body: JSON.stringify({spreadsheetToken: RESOLVED.spreadsheetToken, sheetId, sheetName: sheet.sheet_name,
-        cells: chosen.map(c=>({range:c.range, urls:c.urls, url:c.url, source:c.source, imageCount:c.imageCount}))})});
+        cells: payload})});
     const d = await r.json();
     if (!d.ok) { alert(d.error || '转换启动失败'); return; }
     startPolling(d.jobId);
@@ -795,6 +800,31 @@ function startPolling(jobId) {
           d.results.map(x => `<div class="stat">${x.range || x.recordId || ''}${x.merged ? ` <span class="tag" style="background:#eafaf3;color:var(--ok);">${x.mergedSize ? `${x.merged}张拼成 · ${x.mergedSize}` : `${x.merged}个附件`}</span>` : ''} — <span class="${x.status === 'done' ? 'res-ok' : (x.status === 'skipped' ? 'res-ok' : 'res-fail')}">${x.status === 'done' ? '✓ 已写入附件' : (x.status === 'skipped' ? '⊘ ' + (x.error || '跳过') : ('✗ ' + (x.error || '失败')))}</span>` +
             (x.ms ? ` <span style="color:#8a94a6;" title="${cellTip(x)}">· ${fmtMs(x.ms)}</span>` : '') + `</div>`).join('');
         stat.innerHTML += d.status === 'finished' ? ' · <b class="res-ok">全部完成</b>' : ' · <b class="res-fail">存在失败</b>';
+
+        // 有失败格时给一条窄路：只重跑这几格。否则用户只能返回预览全部重来，已成功的白跑一遍。
+        const failed = d.results.filter(x => x.status === 'failed');
+        if (failed.length && LAST_CONVERT) {
+          const btn = document.createElement('button');
+          btn.className = 'ghost';
+          btn.style.marginTop = '10px';
+          btn.textContent = `只重试失败的 ${failed.length} 格`;
+          btn.onclick = async () => {
+            const ranges = failed.map(x => x.range);
+            const cells = LAST_CONVERT.cells.filter(c => ranges.indexOf(c.range) >= 0);
+            if (!cells.length) return;
+            btn.disabled = true;
+            btn.textContent = '正在重试…';
+            try {
+              const rr = await apiFetch('/api/convert', { method: 'POST', headers: { 'Content-Type': 'application/json' },
+                body: JSON.stringify({ spreadsheetToken: RESOLVED.spreadsheetToken, sheetId: LAST_CONVERT.sheetId,
+                  sheetName: LAST_CONVERT.sheetName, cells }) });
+              const dd = await rr.json();
+              if (!dd.ok) { alert(dd.error || '重试启动失败'); btn.disabled = false; btn.textContent = `只重试失败的 ${failed.length} 格`; return; }
+              startPolling(dd.jobId);
+            } catch (e) { alert('请求失败：' + e.message); btn.disabled = false; }
+          };
+          box.appendChild(btn);
+        }
       }
     } catch (e) { /* 轮询瞬时失败忽略，下一轮继续 */ }
   }, 1000);

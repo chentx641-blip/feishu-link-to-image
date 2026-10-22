@@ -1307,14 +1307,16 @@ async function startBitableJob(appToken, tableId, linkField, attachField, overwr
 // 为什么必须并发：原来是「一格接一格」串行，每格耗时 = 下载 + 拼接 + 写回 三段相加。
 // 但这三段基本都是网络等待（跨境拉原图、把 base64 推给飞书），CPU 只在拼接那 1~3 秒忙。
 // 串行等于让带宽和 CPU 互相干等：10 格各 15s 就是 150s。
-// 改成流水线后总时长≈max(下载÷下载并发, 拼接串行总量, 写回÷写回并发)，实测可压到 1/3 左右。
+// 改成流水线后总时长≈max(下载÷下载并发, 拼接串行总量, 写回串行总量)，实测可压到 1/3 左右。
 // 三段并发度分开设，因为它们争的不是同一种资源：
 //   下载 = 纯带宽，可以放开（默认 4）
 //   拼接 = 纯内存（20MP 画布 RGBA 就是 80MB），Render 免费实例 512MB，必须压到 1
-//   写回 = 受飞书接口 QPS 限制，默认 3
+//   写回 = 飞书写接口有 QPS 限制，必须串行 + 留间隔（见下方 scheduleUpload）
 const MERGE_DL_CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.MERGE_DL_CONCURRENCY || 4)));
 const MERGE_COMPOSE_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.MERGE_COMPOSE_CONCURRENCY || 1)));
-const MERGE_UPLOAD_CONCURRENCY = Math.max(1, Math.min(6, Number(process.env.MERGE_UPLOAD_CONCURRENCY || 3)));
+// 写回不按「并发数」控制，而是「串行 + 最小间隔」：实测 3 路并发写会让飞书直接回 too many request。
+const MERGE_UPLOAD_GAP_MS = Math.max(0, Number(process.env.MERGE_UPLOAD_GAP_MS || 250));
+const MERGE_UPLOAD_RETRIES = Math.max(0, Math.min(8, Number(process.env.MERGE_UPLOAD_RETRIES || 4)));
 // 「同时在处理的单元格」上限。不加这个，一次勾 20 格会让 20 张原图同时躺在内存里排队等拼接：
 // 超长截图原图动辄十几 MB，500MB 的免费实例很容易被撑爆 → 进程被杀 → 任务全丢（前端就显示「查询失败」）。
 const MERGE_CELL_CONCURRENCY = Math.max(1, Math.min(12, Number(process.env.MERGE_CELL_CONCURRENCY || 4)));
@@ -1339,6 +1341,57 @@ function semaphore(max) {
 const jobs = new Map();
 let seq = 1;
 
+// ---------------------------------------------------------------------------
+// 飞书写回：限流识别 + 串行节流 + 退避重试
+// ---------------------------------------------------------------------------
+// 线上实测（2026-10-22）：8 格里 3 格报 "too many request"。原因是当时把写回做成 3 路并发，
+// 多张大图 base64 在同一瞬间推到飞书，直接撞上它的频率限制。
+// 关键判断：限流是「暂时性错误」，隔一两秒再来就能成功，绝不能直接判失败让用户整批重跑。
+// 因此改成：所有写图请求串成一条链，相邻两次至少隔 MERGE_UPLOAD_GAP_MS；
+// 真被限流时按 1s/2s/4s/8s 退避重试，最多 MERGE_UPLOAD_RETRIES 次。
+const RATE_LIMIT_CODES = new Set([99991400, 1254290, 1254291, 1254607, 429]);
+function isRateLimited(wr) {
+  if (!wr) return false;
+  const code = Number(wr.code);
+  if (RATE_LIMIT_CODES.has(code)) return true;
+  const msg = String(wr.msg || wr.error || '').toLowerCase();
+  return /too many request|rate limit|frequency|请求过多|限流|频率/.test(msg);
+}
+
+let _uploadChain = Promise.resolve();
+let _lastUploadAt = 0;
+function scheduleUpload(fn) {
+  const run = _uploadChain.then(async () => {
+    const wait = _lastUploadAt + MERGE_UPLOAD_GAP_MS - Date.now();
+    if (wait > 0) await sleep(wait);
+    try { return await fn(); } finally { _lastUploadAt = Date.now(); }
+  });
+  // 链上无论成败都要继续往下走，否则一次失败会把后续所有写回卡死
+  _uploadChain = run.then(() => {}, () => {});
+  return run;
+}
+
+async function writeImageWithRetry(token, spreadsheetToken, sheetId, range, base64, ext) {
+  let last = null;
+  for (let attempt = 0; attempt <= MERGE_UPLOAD_RETRIES; attempt++) {
+    if (attempt > 0) {
+      const wait = 1000 * Math.pow(2, attempt - 1); // 1s, 2s, 4s, 8s…
+      logEvent({
+        ev: 'ratelimit', range, attempt, waitMs: wait,
+        code: (last && last.code) || null, msg: String((last && (last.msg || last.error)) || '').slice(0, 80),
+      });
+      await sleep(wait);
+    }
+    const wr = await scheduleUpload(() => feishuCall('POST',
+      '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values_image',
+      { body: { range, image: base64, name: 'flc' + ext }, token, timeoutMs: 180000 }));
+    if (wr && wr.code === 0) return { wr, attempts: attempt + 1 };
+    if (!isRateLimited(wr)) return { wr, attempts: attempt + 1 }; // 非限流错误没必要重试
+    last = wr;
+  }
+  return { wr: last, attempts: MERGE_UPLOAD_RETRIES + 1, rateLimitedTooLong: true };
+}
+
 function startJob(spreadsheetToken, sheetId, sheetName, cells) {
   const id = String(seq++);
   const job = {
@@ -1351,7 +1404,6 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
   jobs.set(id, job);
   const dlSem = semaphore(MERGE_DL_CONCURRENCY);
   const cpSem = semaphore(MERGE_COMPOSE_CONCURRENCY);
-  const upSem = semaphore(MERGE_UPLOAD_CONCURRENCY);
   const cellSem = semaphore(MERGE_CELL_CONCURRENCY);
 
   (async () => {
@@ -1415,33 +1467,29 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
           r.bytes = buf.length;
         }
 
-        // ---- 段3：写回（base64 推飞书，最容易被跨境网络拖住的一段）----
+        // ---- 段3：写回（串行 + 最小间隔 + 限流退避重试）----
         r.stage = 'uploading';
         job.active.uploading++;
         const tUp = Date.now();
-        let wr;
+        let wr, attempts = 1, rateLimitedTooLong = false;
         try {
-          await upSem.acquire();
-          try {
-            wr = await feishuCall('POST',
-              '/open-apis/sheets/v2/spreadsheets/' + spreadsheetToken + '/values_image',
-              {
-                body: { range: `${sheetId}!${c.range}:${c.range}`, image: buf.toString('base64'), name: 'flc' + ext },
-                token,
-                timeoutMs: 180000, // 大图跨境上传给足 3 分钟，但必须有上限
-              });
-          } finally { upSem.release(); }
+          const res = await writeImageWithRetry(
+            token, spreadsheetToken, sheetId, `${sheetId}!${c.range}:${c.range}`, buf.toString('base64'), ext);
+          wr = res.wr; attempts = res.attempts; rateLimitedTooLong = !!res.rateLimitedTooLong;
         } finally {
           job.active.uploading--;
           timing.upload = Date.now() - tUp;
         }
+        if (attempts > 1) r.uploadAttempts = attempts;
 
         if (wr && wr.code === 0) {
           r.status = 'done';
           if (bufs.length > 1) r.merged = bufs.length; // 标记：本格由 N 张拼成
         } else {
           r.status = 'failed';
-          r.error = '写入图片失败：' + ((wr && wr.msg) || JSON.stringify(wr || {}).slice(0, 200));
+          r.error = rateLimitedTooLong
+            ? `飞书接口限流：已自动重试 ${attempts} 次仍被拒。稍后只重试这一格即可，其它已成功的格不用重跑`
+            : '写入图片失败：' + ((wr && wr.msg) || JSON.stringify(wr || {}).slice(0, 200));
         }
       } catch (e) {
         r.status = 'failed';
@@ -1769,10 +1817,13 @@ const server = http.createServer(async (req, res) => {
         extractTypes: EXTRACT_TYPES,
         mergePolicy: {
           maxPixels: MERGE_MAX_PIXELS, maxBytes: MERGE_MAX_BYTES, pngLevel: 6,
-          concurrency: { cell: MERGE_CELL_CONCURRENCY, download: MERGE_DL_CONCURRENCY, compose: MERGE_COMPOSE_CONCURRENCY, upload: MERGE_UPLOAD_CONCURRENCY },
+          concurrency: {
+            cell: MERGE_CELL_CONCURRENCY, download: MERGE_DL_CONCURRENCY, compose: MERGE_COMPOSE_CONCURRENCY,
+            upload: 'serial', uploadGapMs: MERGE_UPLOAD_GAP_MS, uploadRetries: MERGE_UPLOAD_RETRIES,
+          },
         },
-        version: '3.4',
-        build: '2026-10-22-pipeline-concurrency',
+        version: '3.5',
+        build: '2026-10-22-ratelimit-safe',
       });
     }
 
