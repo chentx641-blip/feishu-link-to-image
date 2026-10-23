@@ -44,6 +44,9 @@ function getSharp() {
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
 const PORT = process.env.PORT || 8787;
+const VERSION_TAG = '3.6';
+const BUILD_TAG = '2026-10-23-memory-guard';
+const BOOT_AT = Date.now();
 
 const FEISHU_APP_ID = process.env.FEISHU_APP_ID || '';
 const FEISHU_APP_SECRET = process.env.FEISHU_APP_SECRET || '';
@@ -1051,6 +1054,9 @@ async function decodeImage(buf) {
 //       宁可先降编码质量，也不先降分辨率，因为糊的主因就是分辨率被砍。
 const MERGE_MAX_PIXELS = Math.max(1000000, Number(process.env.MERGE_MAX_PIXELS || 20000000));
 const MERGE_MAX_BYTES = Math.max(500000, Number(process.env.MERGE_MAX_BYTES || 8 * 1024 * 1024));
+// 单张原图的像素上限（默认 1.5 亿）。超过这个尺寸，光解码一张就要 600MB 以上，
+// 512MB 的实例必被撑爆 —— 与其让整个任务静默死掉，不如把这一格明确标成「图太大」。
+const MERGE_MAX_INPUT_PIXELS = Math.max(1000000, Number(process.env.MERGE_MAX_INPUT_PIXELS || 150000000));
 
 async function composeImages(buffers) {
   const PAD = 12; // 网格间距（px）
@@ -1062,6 +1068,15 @@ async function composeImages(buffers) {
     const metas = [];
     for (const b of buffers) {
       const m = await S(b, { failOn: 'none', unlimited: true }).metadata();
+      const px = Math.max(1, m.width || 1) * Math.max(1, m.height || 1);
+      if (px > MERGE_MAX_INPUT_PIXELS) {
+        const err = new Error(
+          '单张图片分辨率过大（约 ' + (px / 100000000).toFixed(2) + ' 亿像素，上限 ' +
+          (MERGE_MAX_INPUT_PIXELS / 100000000).toFixed(2) + ' 亿）：拼接需要把原图整张解码，' +
+          '这种尺寸会直接把服务器内存撑爆。请先压缩这张图，或改成「一个单元格放一张」。');
+        err.code = 'IMAGE_TOO_LARGE';
+        throw err;
+      }
       metas.push({ w: Math.max(1, m.width || 1), h: Math.max(1, m.height || 1) });
     }
     const totalPx = metas.reduce((a, m) => a + m.w * m.h, 0);
@@ -1157,6 +1172,9 @@ async function composeImages(buffers) {
     console.log(`[compose] 体积仍未达上限，使用最后一轮结果 ${out.width}x${out.height} ${(out.buf.length / 1048576).toFixed(1)}MB`);
     return { buf: out.buf, ext: '.jpg', width: out.width, height: out.height, scale: sc };
   } catch (se) {
+    // 明确拒绝的超大图要原样抛出去：走纯 JS 兜底只会让它更吃内存（纯 JS 是全量解码），
+    // 反而必崩，还会把「图太大」这条有用信息掩盖成一句「解码失败」。
+    if (se && se.code === 'IMAGE_TOO_LARGE') throw se;
     // 兜底（仅当 sharp 缺失时）：纯 JS 8-bit PNG 解码 + 最近邻缩小 + 合成。清晰度较差但保证可用。
     // 必须打日志：这条分支一旦被走到，画质会明显下降，静默兜底等于把问题藏起来。
     console.error('[compose] sharp 路径失败，改用纯 JS 兜底（画质会下降）: ' + ((se && se.message) || se));
@@ -1318,8 +1336,13 @@ const MERGE_COMPOSE_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.MER
 const MERGE_UPLOAD_GAP_MS = Math.max(0, Number(process.env.MERGE_UPLOAD_GAP_MS || 250));
 const MERGE_UPLOAD_RETRIES = Math.max(0, Math.min(8, Number(process.env.MERGE_UPLOAD_RETRIES || 4)));
 // 「同时在处理的单元格」上限。不加这个，一次勾 20 格会让 20 张原图同时躺在内存里排队等拼接：
-// 超长截图原图动辄十几 MB，500MB 的免费实例很容易被撑爆 → 进程被杀 → 任务全丢（前端就显示「查询失败」）。
-const MERGE_CELL_CONCURRENCY = Math.max(1, Math.min(12, Number(process.env.MERGE_CELL_CONCURRENCY || 4)));
+// 超长截图原图动辄十几 MB，500MB 的免费实例很容易被撑爆 → 进程被杀 → 任务全丢（前端就显示「任务已中断」）。
+// 2026-10-23 从 4 降到 2：有用户反馈某个表「一直」报任务中断、换表却正常 —— 典型的「这次数据量大、把实例内存撑爆」，
+// 每个在途格都要持有一整份原图 + 拼接时的画布，2 个比 4 个的内存峰值低一半。
+const MERGE_CELL_CONCURRENCY = Math.max(1, Math.min(12, Number(process.env.MERGE_CELL_CONCURRENCY || 2)));
+// 内存软上限（MB）：超过就在「开始下一格之前」等一下，让 GC 把已用完的原图回收掉。
+// Node 自己不知道容器只有 512MB，会一路吃到被系统 OOM 杀掉，所以必须自己踩刹车。
+const MERGE_MEM_SOFT_MB = Math.max(128, Number(process.env.MERGE_MEM_SOFT_MB || 330));
 
 // 极简信号量：acquire/release 成对使用
 function semaphore(max) {
@@ -1340,6 +1363,24 @@ function semaphore(max) {
 
 const jobs = new Map();
 let seq = 1;
+
+// 内存刹车：下一格开工前、以及拼接前，如果内存已经逼近容器上限，就先停一下等 GC 回收。
+// 它不能「释放」内存，但能给 V8 回收和上一批请求收尾留时间；真正的兜底是少并发。
+async function waitForMemory(tag) {
+  const limit = MERGE_MEM_SOFT_MB * 1048576;
+  let waited = 0;
+  while (process.memoryUsage().rss > limit && waited < 20000) {
+    if (waited === 0) {
+      logEvent({ ev: 'mem', where: tag, action: 'pause', rssMB: Math.round(process.memoryUsage().rss / 1048576) });
+    }
+    if (global.gc) { try { global.gc(); } catch (e) { /* ignore */ } }
+    await sleep(250);
+    waited += 250;
+  }
+  if (waited > 0) {
+    logEvent({ ev: 'mem', where: tag, action: 'resume', waitedMs: waited, rssMB: Math.round(process.memoryUsage().rss / 1048576) });
+  }
+}
 
 // ---------------------------------------------------------------------------
 // 飞书写回：限流识别 + 串行节流 + 退避重试
@@ -1420,6 +1461,7 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
 
     const runCell = async (c, idx) => {
       await cellSem.acquire(); // 限制同时在途的格数，防止大量原图同时占内存
+      await waitForMemory('cell'); // 内存已逼近上限就先等一下，别把实例撑爆
       const tAll = Date.now();
       const timing = {};
       const r = { range: c.range, source: c.source, status: 'pending', imageCount: c.imageCount || 1, stage: 'queued' };
@@ -1450,6 +1492,7 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
           job.active.composing++;
           const tCp = Date.now();
           try {
+            await waitForMemory('compose'); // 拼接要一整个画布的像素内存，先确保有地方放
             await cpSem.acquire();
             let merged;
             try { merged = await composeImages(bufs); } finally { cpSem.release(); }
@@ -1471,10 +1514,16 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
         r.stage = 'uploading';
         job.active.uploading++;
         const tUp = Date.now();
+        const nImgs = bufs.length;
+        // base64 会让占用翻倍以上（8MB 图 → 10.7MB 字符串）。算完立刻放掉原图引用，
+        // 让 GC 有机会在等待写回网络的那几秒里回收 —— 并发场景下这是内存峰值的一大来源。
+        const b64 = buf.toString('base64');
+        buf = null;
+        bufs = null;
         let wr, attempts = 1, rateLimitedTooLong = false;
         try {
           const res = await writeImageWithRetry(
-            token, spreadsheetToken, sheetId, `${sheetId}!${c.range}:${c.range}`, buf.toString('base64'), ext);
+            token, spreadsheetToken, sheetId, `${sheetId}!${c.range}:${c.range}`, b64, ext);
           wr = res.wr; attempts = res.attempts; rateLimitedTooLong = !!res.rateLimitedTooLong;
         } finally {
           job.active.uploading--;
@@ -1484,7 +1533,7 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
 
         if (wr && wr.code === 0) {
           r.status = 'done';
-          if (bufs.length > 1) r.merged = bufs.length; // 标记：本格由 N 张拼成
+          if (nImgs > 1) r.merged = nImgs; // 标记：本格由 N 张拼成
         } else {
           r.status = 'failed';
           r.error = rateLimitedTooLong
@@ -1792,6 +1841,33 @@ function adminGateOK(req, res, body) {
   return false;
 }
 
+// ---------------------------------------------------------------------------
+// 崩溃取证
+// ---------------------------------------------------------------------------
+// Render 实例被系统 OOM 杀掉时，进程连一行输出都没有，事后完全不知道发生过什么，
+// 只能看到前端「任务已中断」。这里把未捕获的异常记进内存（/api/health 的 lastCrash 可查）。
+// 注意：真正的 OOM kill 抓不到（内核直接杀进程），但「heap out of memory」这类 V8 报错能抓到。
+let LAST_CRASH = null;
+// 内存峰值探针：每 0.5s 采一次，用来回答「这台实例到底有多接近 512MB」。
+let PEAK_RSS_MB = 0;
+setInterval(() => {
+  const mb = Math.round(process.memoryUsage().rss / 1048576);
+  if (mb > PEAK_RSS_MB) PEAK_RSS_MB = mb;
+}, 500).unref();
+function recordCrash(type, e) {
+  const msg = String((e && (e.stack || e.message)) || e).slice(0, 600);
+  LAST_CRASH = { ts: new Date().toISOString(), type, msg };
+  try { console.error('[crash] ' + type + ': ' + msg); } catch (err) { /* ignore */ }
+  try { logEvent({ ev: 'crash', type, msg: msg.slice(0, 300) }); } catch (err) { /* ignore */ }
+}
+process.on('uncaughtException', (e) => {
+  recordCrash('uncaughtException', e);
+  setTimeout(() => process.exit(1), 300); // 记录完仍然退出，保持原语义
+});
+process.on('unhandledRejection', (e) => {
+  recordCrash('unhandledRejection', e); // 未处理的 Promise 拒绝不致命，记下来继续跑
+});
+
 const server = http.createServer(async (req, res) => {
   try {
     const urlp = req.url.split('?')[0];
@@ -1822,8 +1898,29 @@ const server = http.createServer(async (req, res) => {
             upload: 'serial', uploadGapMs: MERGE_UPLOAD_GAP_MS, uploadRetries: MERGE_UPLOAD_RETRIES,
           },
         },
-        version: '3.5',
-        build: '2026-10-22-ratelimit-safe',
+        version: VERSION_TAG,
+        build: BUILD_TAG,
+      });
+    }
+
+    // 健康/诊断（公开，不含敏感信息）。
+    // 判断「任务已中断」时先看这里的 uptimeSec：如果是几十上百秒，说明实例刚被重启过（多半是内存撑爆）。
+    if (req.method === 'GET' && urlp === '/api/health') {
+      const mu = process.memoryUsage();
+      const running = [];
+      for (const j of jobs.values()) {
+        if (j.status === 'running') running.push({ id: j.id, total: j.total, done: j.done, elapsedMs: Date.now() - j.startedAt });
+      }
+      return sendJSON(res, 200, {
+        ok: true, version: VERSION_TAG, build: BUILD_TAG,
+        uptimeSec: Math.round((Date.now() - BOOT_AT) / 1000),
+        rssMB: Math.round(mu.rss / 1048576),
+        heapUsedMB: Math.round(mu.heapUsed / 1048576),
+        peakRssMB: PEAK_RSS_MB,
+        memSoftLimitMB: MERGE_MEM_SOFT_MB,
+        jobs: { total: jobs.size, running },
+        lastCrash: LAST_CRASH,
+        concurrency: { cell: MERGE_CELL_CONCURRENCY, download: MERGE_DL_CONCURRENCY, compose: MERGE_COMPOSE_CONCURRENCY },
       });
     }
 
