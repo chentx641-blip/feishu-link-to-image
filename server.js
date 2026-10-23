@@ -44,8 +44,8 @@ function getSharp() {
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
 const PORT = process.env.PORT || 8787;
-const VERSION_TAG = '3.9';
-const BUILD_TAG = '2026-10-23-diag-boot';
+const VERSION_TAG = '3.10';
+const BUILD_TAG = '2026-10-23-canvas-fit';
 const BOOT_AT = Date.now();
 // 最后一次收到请求的时间：用来判断实例是「被平台空闲休眠」还是「被内存撑爆杀掉」。
 // Render 免费实例要连续 15 分钟没有任何请求才会休眠，所以只要重启前一刻还有流量，就一定不是休眠。
@@ -1067,6 +1067,35 @@ const MERGE_MAX_IMAGES_PER_CELL = Math.max(1, Math.min(60, Number(process.env.ME
 async function composeImages(buffers) {
   const PAD = 12; // 网格间距（px）
 
+  // 画布布局：给定缩放系数，算出每张图的宽高、行列数和画布总尺寸。
+  // 必须抽成一个函数 —— 原来「算 scale」和「建画布」两处各自推了一遍布局，
+  // 算 scale 只用「输入像素和」，建画布却还要加留白，两者对不上，
+  // 于是画布悄悄超出预算（实测 20MP 预算算出 36.5MP，单格峰值 521MB，超过实例 512MB 上限）。
+  const layoutAt = (metas, sc) => {
+    const n = metas.length;
+    const tws = [];
+    const ths = [];
+    for (const m of metas) {
+      tws.push(Math.max(1, Math.round(m.w * sc)));
+      ths.push(Math.max(1, Math.round(m.h * sc)));
+    }
+    const cols = Math.max(1, Math.ceil(Math.sqrt(n))); // 2 张→并排，4 张→2×2
+    const rows = Math.ceil(n / cols);
+    const colW = new Array(cols).fill(0);
+    const rowH = new Array(rows).fill(0);
+    for (let i = 0; i < n; i++) {
+      const c = i % cols;
+      const r = Math.floor(i / cols);
+      colW[c] = Math.max(colW[c], tws[i]);
+      rowH[r] = Math.max(rowH[r], ths[i]);
+    }
+    return {
+      n, tws, ths, cols, rows, colW, rowH,
+      gridW: colW.reduce((a, b) => a + b, 0) + PAD * (cols + 1),
+      gridH: rowH.reduce((a, b) => a + b, 0) + PAD * (rows + 1),
+    };
+  };
+
   // 主路径：sharp 全程（高质量解码 + Lanczos 缩小 + 高质量合成），PNG/JPEG/WEBP 全支持
   try {
     const S = getSharp();
@@ -1085,8 +1114,25 @@ async function composeImages(buffers) {
       }
       metas.push({ w: Math.max(1, m.width || 1), h: Math.max(1, m.height || 1) });
     }
-    const totalPx = metas.reduce((a, m) => a + m.w * m.h, 0);
-    const baseScale = totalPx > MERGE_MAX_PIXELS ? Math.sqrt(MERGE_MAX_PIXELS / totalPx) : 1;
+    // 反解缩放系数：目标是让「画布面积」落进 MERGE_MAX_PIXELS，而不是只让「输入像素和」落进去。
+    // 长短不一的图并排时，短的那列会被拉满整格高度，留白同样占画布像素 —— 只按输入像素算，
+    // 画布会比预算大一大截。面积对 sc 近似平方关系，先开方给初值，再按实际画布面积迭代收敛；
+    // 取整会让它非严格单调，所以每轮乘 0.995 的系数只往小走。
+    let baseScale = 1;
+    const pxAt = (sc) => {
+      const L = layoutAt(metas, sc);
+      return L.gridW * L.gridH;
+    };
+    const px1 = pxAt(1);
+    if (px1 > MERGE_MAX_PIXELS) {
+      let s = Math.sqrt(MERGE_MAX_PIXELS / px1);
+      for (let i = 0; i < 8; i++) {
+        const px = pxAt(s);
+        if (px <= MERGE_MAX_PIXELS) break;
+        s *= Math.sqrt(MERGE_MAX_PIXELS / px) * 0.995;
+      }
+      baseScale = Math.max(0.02, Math.min(1, s));
+    }
 
     // 缩放后中间图的缓存：如果 PNG 试完体积超标要回落 JPEG，直接复用同一批缩放结果，
     // 不必把「解码 + Lanczos 重采样」白跑第二遍（超长图这一遍就是好几秒）。
@@ -1117,17 +1163,13 @@ async function composeImages(buffers) {
         preparedCache = { sc, items: prepared };
       }
       const n = prepared.length;
-      const cols = Math.max(1, Math.ceil(Math.sqrt(n))); // 2 张→并排，4 张→2×2
-      const rows = Math.ceil(n / cols);
-      const colW = new Array(cols).fill(0);
-      const rowH = new Array(rows).fill(0);
-      prepared.forEach((im, i) => {
-        const c = i % cols, r = Math.floor(i / cols);
-        colW[c] = Math.max(colW[c], im.tw);
-        rowH[r] = Math.max(rowH[r], im.th);
-      });
-      const gridW = colW.reduce((a, b) => a + b, 0) + PAD * (cols + 1);
-      const gridH = rowH.reduce((a, b) => a + b, 0) + PAD * (rows + 1);
+      const L = layoutAt(metas, sc); // 与算 scale 时同一套布局，杜绝两处算法漂移
+      const cols = L.cols;
+      const rows = L.rows;
+      const colW = L.colW;
+      const rowH = L.rowH;
+      const gridW = L.gridW;
+      const gridH = L.gridH;
       const composites = [];
       let x = PAD;
       for (let c = 0; c < cols; c++) {
@@ -1143,7 +1185,9 @@ async function composeImages(buffers) {
         create: { width: gridW, height: gridH, channels: 4, background: { r: 255, g: 255, b: 255, alpha: 1 } },
       }).composite(composites);
       const buf = asJpeg
-        ? await canvas.jpeg({ quality: 92, chromaSubsampling: '4:4:4' }).toBuffer()
+        // 4:4:4 编码 20MP 画布峰值约 353MB，4:2:0 约 252MB。画布大时用 4:2:0 换内存，
+        // 画布 ≤12MP 时仍保持 4:4:4，画质与以前完全一致。
+        ? await canvas.jpeg({ quality: 92, chromaSubsampling: gridW * gridH > 12000000 ? '4:2:0' : '4:4:4' }).toBuffer()
         // PNG 压缩级别 9→6：PNG 是无损格式，级别只影响压缩耗时/体积，像素完全相同。
         // 实测 1506x13632 长截图：level 9 需 1.66s、level 6 仅 0.37s，体积 0.16→0.23MB。
         // 为几十 KB 体积多烧 4 倍 CPU，在这种「用户现场等结果」的场景完全不划算。
@@ -1158,15 +1202,30 @@ async function composeImages(buffers) {
       console.log(`[compose] n=${buffers.length} scale=${sc.toFixed(3)} ${out.width}x${out.height} ${(out.buf.length / 1048576).toFixed(1)}MB png`);
       return { buf: out.buf, ext: '.png', width: out.width, height: out.height, scale: sc };
     }
-    // 2) PNG 太大（长截图里带照片时常见）→ 换 JPEG q92 4:4:4，分辨率不动。
-    //    复用上面已缩放好的中间图，不会重复解码 + 重采样。
+    // 2) PNG 超体积 → 先降一档分辨率继续走 PNG，而不是同尺寸换 JPEG。
+    //    实测同样 20MP 画布：PNG 编码峰值约 155MB，JPEG q92 4:4:4 要约 353MB。
+    //    旧逻辑「PNG 试一次 → 同尺寸再用 JPEG 渲一遍」等于把两次渲染的内存叠起来，
+    //    在「长截图 + 多图格」上直接把实例送进 OOM（实测峰值 521MB > 512MB 上限），
+    //    用户看到的就是「任务已中断：服务刚重启」。改成降档 PNG，峰值稳定在 160MB 上下，
+    //    而且是无损的，清晰度反而比同尺寸 JPEG 更好。
+    //    体积近似正比于像素数，故按 sqrt(目标/当前) 推目标缩放系数。
+    for (let i = 0; i < 3; i++) {
+      const want = sc * Math.sqrt(MERGE_MAX_BYTES / out.buf.length) * 0.97;
+      sc = Math.max(0.05, Math.min(sc * 0.92, want));
+      out = await render(sc, false);
+      if (out.buf.length <= MERGE_MAX_BYTES) {
+        console.log(`[compose] n=${buffers.length} scale=${sc.toFixed(3)} ${out.width}x${out.height} ${(out.buf.length / 1048576).toFixed(1)}MB png(降分辨率第${i + 1}轮)`);
+        return { buf: out.buf, ext: '.png', width: out.width, height: out.height, scale: sc };
+      }
+    }
+    // 3) PNG 连降三档仍超（照片占比很高的格子）→ 才换 JPEG，分辨率不再动
     out = await render(sc, true);
     if (out.buf.length <= MERGE_MAX_BYTES) {
       console.log(`[compose] n=${buffers.length} scale=${sc.toFixed(3)} ${out.width}x${out.height} ${(out.buf.length / 1048576).toFixed(1)}MB jpg(体积回落)`);
       return { buf: out.buf, ext: '.jpg', width: out.width, height: out.height, scale: sc };
     }
-    // 3) 仍太大 → 才逐步降分辨率（每次 ×0.8，最多 4 轮）
-    for (let i = 0; i < 4; i++) {
+    // 4) JPEG 仍太大 → 再逐步降分辨率（每次 ×0.8，最多 3 轮）
+    for (let i = 0; i < 3; i++) {
       sc *= 0.8;
       out = await render(sc, true);
       if (out.buf.length <= MERGE_MAX_BYTES) {
@@ -1343,9 +1402,9 @@ const MERGE_UPLOAD_GAP_MS = Math.max(0, Number(process.env.MERGE_UPLOAD_GAP_MS |
 const MERGE_UPLOAD_RETRIES = Math.max(0, Math.min(8, Number(process.env.MERGE_UPLOAD_RETRIES || 4)));
 // 「同时在处理的单元格」上限。不加这个，一次勾 20 格会让 20 张原图同时躺在内存里排队等拼接：
 // 超长截图原图动辄十几 MB，500MB 的免费实例很容易被撑爆 → 进程被杀 → 任务全丢（前端就显示「任务已中断」）。
-// 2026-10-23 从 4 降到 2：有用户反馈某个表「一直」报任务中断、换表却正常 —— 典型的「这次数据量大、把实例内存撑爆」，
-// 每个在途格都要持有一整份原图 + 拼接时的画布，2 个比 4 个的内存峰值低一半。
-const MERGE_CELL_CONCURRENCY = Math.max(1, Math.min(12, Number(process.env.MERGE_CELL_CONCURRENCY || 2)));
+// 2026-10-23 从 4 降到 2、再降到 1：实测「竞品任务」表里 10 张图的格子，单格拼接峰值就 440MB，
+// 两格同时在跑必定超过免费实例 512MB。宁可慢一点，也不能用完一次就把实例送进重启。
+const MERGE_CELL_CONCURRENCY = Math.max(1, Math.min(12, Number(process.env.MERGE_CELL_CONCURRENCY || 1)));
 // 内存软上限（MB）：超过就在「开始下一格 / 下载下一张 / 拼接前」等一下，让 GC 把用完的原图回收掉。
 // Node 自己不知道容器只有 512MB，会一路吃到被系统 OOM 杀掉，所以必须自己踩刹车。
 // 2026-10-23 从 330 降到 260：线上仍出现「转换中实例重启」，说明 330 已经太贴近生死线
