@@ -45,8 +45,11 @@ const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
 const PORT = process.env.PORT || 8787;
 const VERSION_TAG = '3.9';
-const BUILD_TAG = '2026-10-23-mem-tighten';
+const BUILD_TAG = '2026-10-23-diag-boot';
 const BOOT_AT = Date.now();
+// 最后一次收到请求的时间：用来判断实例是「被平台空闲休眠」还是「被内存撑爆杀掉」。
+// Render 免费实例要连续 15 分钟没有任何请求才会休眠，所以只要重启前一刻还有流量，就一定不是休眠。
+let LAST_REQ_AT = 0;
 
 const FEISHU_APP_ID = process.env.FEISHU_APP_ID || '';
 const FEISHU_APP_SECRET = process.env.FEISHU_APP_SECRET || '';
@@ -1894,8 +1897,23 @@ process.on('uncaughtException', (e) => {
 process.on('unhandledRejection', (e) => {
   recordCrash('unhandledRejection', e); // 未处理的 Promise 拒绝不致命，记下来继续跑
 });
+// SIGTERM/SIGINT：平台要停这个实例时一定会先发 SIGTERM（部署、休眠、缩容都是）。
+// 记下来就能区分「平台主动停」（能抓到这条）和「内存撑爆被内核 SIGKILL」（抓不到任何信号）。
+let LAST_STOP = null;
+for (const sig of ['SIGTERM', 'SIGINT']) {
+  process.on(sig, () => {
+    LAST_STOP = {
+      ts: new Date().toISOString(), signal: sig,
+      uptimeSec: Math.round((Date.now() - BOOT_AT) / 1000), peakRssMB: PEAK_RSS_MB,
+      running: [...jobs.values()].filter((j) => j.status === 'running').length,
+    };
+    try { console.error('[stop] ' + JSON.stringify(LAST_STOP)); } catch (e) { /* ignore */ }
+    process.exit(0);
+  });
+}
 
 const server = http.createServer(async (req, res) => {
+  LAST_REQ_AT = Date.now(); // 用来区分「内存被杀」和「平台空闲休眠」：休眠前一定先有 15 分钟无请求
   try {
     const urlp = req.url.split('?')[0];
     const q = new URL(req.url, 'http://localhost').searchParams;
@@ -1944,12 +1962,15 @@ const server = http.createServer(async (req, res) => {
       return sendJSON(res, 200, {
         ok: true, version: VERSION_TAG, build: BUILD_TAG,
         uptimeSec: Math.round((Date.now() - BOOT_AT) / 1000),
+        bootAt: new Date(BOOT_AT).toISOString(),
+        lastRequestAgoSec: LAST_REQ_AT ? Math.round((Date.now() - LAST_REQ_AT) / 1000) : null,
         rssMB: Math.round(mu.rss / 1048576),
         heapUsedMB: Math.round(mu.heapUsed / 1048576),
         peakRssMB: PEAK_RSS_MB,
         memSoftLimitMB: MERGE_MEM_SOFT_MB,
         jobs: { total: jobs.size, running },
         lastCrash: LAST_CRASH,
+        lastStop: LAST_STOP,
         concurrency: { cell: MERGE_CELL_CONCURRENCY, download: MERGE_DL_CONCURRENCY, compose: MERGE_COMPOSE_CONCURRENCY },
       });
     }
