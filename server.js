@@ -44,8 +44,8 @@ function getSharp() {
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
 const PORT = process.env.PORT || 8787;
-const VERSION_TAG = '3.8';
-const BUILD_TAG = '2026-10-23-no-cache';
+const VERSION_TAG = '3.9';
+const BUILD_TAG = '2026-10-23-mem-tighten';
 const BOOT_AT = Date.now();
 
 const FEISHU_APP_ID = process.env.FEISHU_APP_ID || '';
@@ -1054,9 +1054,12 @@ async function decodeImage(buf) {
 //       宁可先降编码质量，也不先降分辨率，因为糊的主因就是分辨率被砍。
 const MERGE_MAX_PIXELS = Math.max(1000000, Number(process.env.MERGE_MAX_PIXELS || 20000000));
 const MERGE_MAX_BYTES = Math.max(500000, Number(process.env.MERGE_MAX_BYTES || 8 * 1024 * 1024));
-// 单张原图的像素上限（默认 1.5 亿）。超过这个尺寸，光解码一张就要 600MB 以上，
-// 512MB 的实例必被撑爆 —— 与其让整个任务静默死掉，不如把这一格明确标成「图太大」。
-const MERGE_MAX_INPUT_PIXELS = Math.max(1000000, Number(process.env.MERGE_MAX_INPUT_PIXELS || 150000000));
+// 单张原图的像素上限。拼接时必须把原图整张解码，内存 ≈ 像素数 × 4 字节：
+//   2000 万像素 ≈ 80MB（安全）／5000 万 ≈ 200MB（临界）／1.5 亿 ≈ 600MB（必爆）。
+// 所以上限设 5000 万，而不是最初拍脑袋的 1.5 亿 —— 那个值比实例总内存还大，等于没设。
+const MERGE_MAX_INPUT_PIXELS = Math.max(1000000, Number(process.env.MERGE_MAX_INPUT_PIXELS || 50000000));
+// 单个单元格最多几张图：一格 20 张就算每张只有 5MB，也是 100MB 同时驻留。
+const MERGE_MAX_IMAGES_PER_CELL = Math.max(1, Math.min(60, Number(process.env.MERGE_MAX_IMAGES_PER_CELL || 20)));
 
 async function composeImages(buffers) {
   const PAD = 12; // 网格间距（px）
@@ -1340,9 +1343,11 @@ const MERGE_UPLOAD_RETRIES = Math.max(0, Math.min(8, Number(process.env.MERGE_UP
 // 2026-10-23 从 4 降到 2：有用户反馈某个表「一直」报任务中断、换表却正常 —— 典型的「这次数据量大、把实例内存撑爆」，
 // 每个在途格都要持有一整份原图 + 拼接时的画布，2 个比 4 个的内存峰值低一半。
 const MERGE_CELL_CONCURRENCY = Math.max(1, Math.min(12, Number(process.env.MERGE_CELL_CONCURRENCY || 2)));
-// 内存软上限（MB）：超过就在「开始下一格之前」等一下，让 GC 把已用完的原图回收掉。
+// 内存软上限（MB）：超过就在「开始下一格 / 下载下一张 / 拼接前」等一下，让 GC 把用完的原图回收掉。
 // Node 自己不知道容器只有 512MB，会一路吃到被系统 OOM 杀掉，所以必须自己踩刹车。
-const MERGE_MEM_SOFT_MB = Math.max(128, Number(process.env.MERGE_MEM_SOFT_MB || 330));
+// 2026-10-23 从 330 降到 260：线上仍出现「转换中实例重启」，说明 330 已经太贴近生死线
+// （330 只是 rss 检查点，检查之后的一次解码分配就可能把总量顶过 512）。
+const MERGE_MEM_SOFT_MB = Math.max(128, Number(process.env.MERGE_MEM_SOFT_MB || 260));
 
 // 极简信号量：acquire/release 成对使用
 function semaphore(max) {
@@ -1366,8 +1371,8 @@ let seq = 1;
 
 // 内存刹车：下一格开工前、以及拼接前，如果内存已经逼近容器上限，就先停一下等 GC 回收。
 // 它不能「释放」内存，但能给 V8 回收和上一批请求收尾留时间；真正的兜底是少并发。
-async function waitForMemory(tag) {
-  const limit = MERGE_MEM_SOFT_MB * 1048576;
+async function waitForMemory(tag, limitMb) {
+  const limit = (limitMb || MERGE_MEM_SOFT_MB) * 1048576;
   let waited = 0;
   while (process.memoryUsage().rss > limit && waited < 20000) {
     if (waited === 0) {
@@ -1466,9 +1471,14 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
       const timing = {};
       const r = { range: c.range, source: c.source, status: 'pending', imageCount: c.imageCount || 1, stage: 'queued' };
       job.results[idx] = r;
+      let nImgs = 1; // 必须在 try 外声明：finally 里的日志要用到它
       try {
         const urls = (Array.isArray(c.urls) && c.urls.length > 0) ? c.urls : (c.url ? [c.url] : []);
         if (urls.length === 0) throw new Error('该单元格没有可用链接');
+        if (urls.length > MERGE_MAX_IMAGES_PER_CELL) {
+          throw new Error('这个单元格有 ' + urls.length + ' 张图，超过单格处理上限（' + MERGE_MAX_IMAGES_PER_CELL +
+            ' 张）。全部同时驻留内存会把服务器压垮，请把它拆到多个单元格，或分批转换。');
+        }
 
         // ---- 段1：下载（同格多图并发，每张占一个带宽名额）----
         r.stage = 'downloading';
@@ -1478,12 +1488,19 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
         try {
           bufs = await Promise.all(urls.map(async (u) => {
             await dlSem.acquire();
-            try { return await downloadImage(u); } finally { dlSem.release(); }
+            try {
+              const b = await downloadImage(u);
+              // 每张下载完就看一眼内存：多张超大图同时驻留，是最容易把实例顶爆的时刻
+              if (process.memoryUsage().rss > MERGE_MEM_SOFT_MB * 1048576) await waitForMemory('download');
+              return b;
+            } finally { dlSem.release(); }
           }));
         } finally {
           job.active.downloading--;
           timing.download = Date.now() - tDl;
         }
+        // 记下这格一共拉了多少字节：排查内存问题时，这是「这一格有多重」的直接指标
+        r.srcBytes = bufs.reduce((a, b) => a + b.length, 0);
 
         // ---- 段2：拼接（仅一格多图；独占内存，串行）----
         let buf, ext;
@@ -1492,7 +1509,9 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
           job.active.composing++;
           const tCp = Date.now();
           try {
-            await waitForMemory('compose'); // 拼接要一整个画布的像素内存，先确保有地方放
+            // 拼接是整条链路里最吃内存的一步（一张原图解码 + 一整张画布），
+            // 所以门槛要比平时更低，给解码和画布预留出空间，否则「检查通过」之后照样会顶爆。
+            await waitForMemory('compose', Math.max(120, MERGE_MEM_SOFT_MB - 90));
             await cpSem.acquire();
             let merged;
             try { merged = await composeImages(bufs); } finally { cpSem.release(); }
@@ -1514,7 +1533,7 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
         r.stage = 'uploading';
         job.active.uploading++;
         const tUp = Date.now();
-        const nImgs = bufs.length;
+        nImgs = bufs.length;
         // base64 会让占用翻倍以上（8MB 图 → 10.7MB 字符串）。算完立刻放掉原图引用，
         // 让 GC 有机会在等待写回网络的那几秒里回收 —— 并发场景下这是内存峰值的一大来源。
         const b64 = buf.toString('base64');
@@ -1554,6 +1573,7 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
           ev: 'cell', jobId: id, range: r.range, status: r.status,
           downloadMs: timing.download || 0, composeMs: timing.compose || 0, uploadMs: timing.upload || 0,
           totalMs: r.ms, bytes: r.mergedBytes || r.bytes || null, dims: r.mergedSize || null,
+          srcBytes: r.srcBytes || null, images: nImgs, rssMB: Math.round(process.memoryUsage().rss / 1048576),
           err: r.status === 'failed' ? String(r.error || '').slice(0, 160) : undefined,
         });
         cellSem.release();
@@ -1900,6 +1920,8 @@ const server = http.createServer(async (req, res) => {
         extractTypes: EXTRACT_TYPES,
         mergePolicy: {
           maxPixels: MERGE_MAX_PIXELS, maxBytes: MERGE_MAX_BYTES, pngLevel: 6,
+          maxInputPixels: MERGE_MAX_INPUT_PIXELS, maxImagesPerCell: MERGE_MAX_IMAGES_PER_CELL,
+          memSoftMB: MERGE_MEM_SOFT_MB,
           concurrency: {
             cell: MERGE_CELL_CONCURRENCY, download: MERGE_DL_CONCURRENCY, compose: MERGE_COMPOSE_CONCURRENCY,
             upload: 'serial', uploadGapMs: MERGE_UPLOAD_GAP_MS, uploadRetries: MERGE_UPLOAD_RETRIES,
