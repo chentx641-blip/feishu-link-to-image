@@ -44,8 +44,8 @@ function getSharp() {
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
 const PORT = process.env.PORT || 8787;
-const VERSION_TAG = '3.7';
-const BUILD_TAG = '2026-10-23-route-fallback';
+const VERSION_TAG = '3.8';
+const BUILD_TAG = '2026-10-23-no-cache';
 const BOOT_AT = Date.now();
 
 const FEISHU_APP_ID = process.env.FEISHU_APP_ID || '';
@@ -1808,13 +1808,20 @@ function readBody(req) {
 }
 function sendJSON(res, code, obj) {
   const s = JSON.stringify(obj);
-  res.writeHead(code, { 'Content-Type': 'application/json; charset=utf-8' });
+  // no-store：接口结果一律不许缓存。之前没有缓存头，浏览器/中间代理把一次 404 缓存住之后，
+  // 用户怎么刷新都还是那张旧页面 —— 表现就是「网站打不开」。
+  res.writeHead(code, {
+    'Content-Type': 'application/json; charset=utf-8',
+    'Cache-Control': 'no-store, no-cache, must-revalidate',
+    'Pragma': 'no-cache',
+  });
   res.end(s);
 }
 function serveFile(res, file, type) {
   fs.readFile(file, (err, data) => {
     if (err) { res.writeHead(404); res.end('not found'); return; }
-    res.writeHead(200, { 'Content-Type': type });
+    // 页面也不缓存：这个工具每次上线都会改前端，让浏览器一直拿旧页面只会制造「明明修好了却还报旧错」。
+    res.writeHead(200, { 'Content-Type': type, 'Cache-Control': 'no-store, no-cache, must-revalidate' });
     res.end(data);
   });
 }
@@ -2200,14 +2207,14 @@ const server = http.createServer(async (req, res) => {
       return res.end();
     }
 
-    // 未知「页面」路径 → 送回首页。
-    // 线上真实发生过：地址里带了个奇怪的尾巴（或漏掉 /api），打开就是一行 {"ok":false,"error":"not found"}，
-    // 看起来像服务坏了。API 路径仍然如实返回 404，页面路径一律引导回入口。
-    if (req.method === 'GET' && !urlp.startsWith('/api/')) {
-      // 记下用户真实请求的 url（排除轮询噪音：那些都是 /api/ 开头的），便于复盘「打不开」到底是哪个地址
-      logEvent({ ev: 'redirect', url: String(req.url).slice(0, 200), ua: String(req.headers['user-agent'] || '').slice(0, 60) });
-      res.writeHead(302, { Location: '/' });
-      return res.end();
+    // 未知「页面」路径 → 直接把首页内容返回（200）。
+    // 不甩一行 {"ok":false,"error":"not found"}（看起来像服务坏了），也不用 302
+    // （302 会被浏览器/中间代理缓存，用户反而一直看到旧结果）。
+    // 线上真实发生过：有人地址里带了多余尾巴 / 漏掉 /api，刷新多次都是这行 JSON，误判成网站打不开。
+    if (req.method === 'GET' && (!urlp.startsWith('/api/') || urlp === '/api/')) {
+      // 记下真实请求的 url（排除轮询噪音：那些都是 /api/ 开头的），便于复盘到底是哪个地址
+      logEvent({ ev: 'unknown_path', url: String(req.url).slice(0, 200), ua: String(req.headers['user-agent'] || '').slice(0, 60) });
+      return serveFile(res, path.join(PUBLIC, 'index.html'), 'text/html; charset=utf-8');
     }
 
     res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
