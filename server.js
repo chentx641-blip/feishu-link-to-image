@@ -44,8 +44,8 @@ function getSharp() {
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
 const PORT = process.env.PORT || 8787;
-const VERSION_TAG = '3.6';
-const BUILD_TAG = '2026-10-23-memory-guard';
+const VERSION_TAG = '3.7';
+const BUILD_TAG = '2026-10-23-route-fallback';
 const BOOT_AT = Date.now();
 
 const FEISHU_APP_ID = process.env.FEISHU_APP_ID || '';
@@ -1905,7 +1905,8 @@ const server = http.createServer(async (req, res) => {
 
     // 健康/诊断（公开，不含敏感信息）。
     // 判断「任务已中断」时先看这里的 uptimeSec：如果是几十上百秒，说明实例刚被重启过（多半是内存撑爆）。
-    if (req.method === 'GET' && urlp === '/api/health') {
+    // /health 也认：有人会漏掉 /api 前缀，直接访问别报 404。
+    if (req.method === 'GET' && (urlp === '/api/health' || urlp === '/health')) {
       const mu = process.memoryUsage();
       const running = [];
       for (const j of jobs.values()) {
@@ -2191,6 +2192,22 @@ const server = http.createServer(async (req, res) => {
       if (!adminGateOK(req, res, null)) return;
       const n = Math.max(1, Math.min(LOG_RING_MAX, Number(q.get('n') || 200)));
       return sendJSON(res, 200, { ok: true, total: LOG_RING.length, logs: LOG_RING.slice(-n) });
+    }
+
+    // 浏览器会自动请求图标，静默应付，别让它落进 404 兜底
+    if (req.method === 'GET' && urlp === '/favicon.ico') {
+      res.writeHead(204);
+      return res.end();
+    }
+
+    // 未知「页面」路径 → 送回首页。
+    // 线上真实发生过：地址里带了个奇怪的尾巴（或漏掉 /api），打开就是一行 {"ok":false,"error":"not found"}，
+    // 看起来像服务坏了。API 路径仍然如实返回 404，页面路径一律引导回入口。
+    if (req.method === 'GET' && !urlp.startsWith('/api/')) {
+      // 记下用户真实请求的 url（排除轮询噪音：那些都是 /api/ 开头的），便于复盘「打不开」到底是哪个地址
+      logEvent({ ev: 'redirect', url: String(req.url).slice(0, 200), ua: String(req.headers['user-agent'] || '').slice(0, 60) });
+      res.writeHead(302, { Location: '/' });
+      return res.end();
     }
 
     res.writeHead(404, { 'Content-Type': 'application/json; charset=utf-8' });
