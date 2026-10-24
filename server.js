@@ -44,8 +44,8 @@ function getSharp() {
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
 const PORT = process.env.PORT || 8787;
-const VERSION_TAG = '3.11';
-const BUILD_TAG = '2026-10-24-perf-pipeline-1141';
+const VERSION_TAG = '3.12';
+const BUILD_TAG = '2026-10-24-big-image';
 const BOOT_AT = Date.now();
 // 最后一次收到请求的时间：用来判断实例是「被平台空闲休眠」还是「被内存撑爆杀掉」。
 // Render 免费实例要连续 15 分钟没有任何请求才会休眠，所以只要重启前一刻还有流量，就一定不是休眠。
@@ -1075,10 +1075,18 @@ async function decodeImage(buf) {
 //       宁可先降编码质量，也不先降分辨率，因为糊的主因就是分辨率被砍。
 const MERGE_MAX_PIXELS = Math.max(1000000, Number(process.env.MERGE_MAX_PIXELS || 20000000));
 const MERGE_MAX_BYTES = Math.max(500000, Number(process.env.MERGE_MAX_BYTES || 8 * 1024 * 1024));
-// 单张原图的像素上限。拼接时必须把原图整张解码，内存 ≈ 像素数 × 4 字节：
-//   2000 万像素 ≈ 80MB（安全）／5000 万 ≈ 200MB（临界）／1.5 亿 ≈ 600MB（必爆）。
-// 所以上限设 5000 万，而不是最初拍脑袋的 1.5 亿 —— 那个值比实例总内存还大，等于没设。
-const MERGE_MAX_INPUT_PIXELS = Math.max(1000000, Number(process.env.MERGE_MAX_INPUT_PIXELS || 50000000));
+// 单张原图的像素上限。
+//
+// 2026-10-24 更正：这里原来写「内存 ≈ 像素数 × 4 字节」并据此设 5000 万，
+// 这个模型是错的 —— 它假设 sharp/libvips 会把整张原图解码成一块 RGBA 放在内存里。
+// 实际 libvips 是 demand-driven 流水线：边解码边缩放边编码，内存只跟「条带」有关。
+// 实测同一台机器、真实噪点 JPEG（不是纯色，避免走 fast path）缩到 20MP 的峰值 RSS：
+//   5600 万像素（8000×7000）→ 127MB
+//   1.00 亿像素（10000×10000）→ 168MB
+// 所以 5600 万像素的图完全能处理，而旧上限 5000 万把它误判成「会撑爆内存」直接拒绝，
+// 用户看到的就是「单张图片分辨率过大」。
+// 新上限按实测余量放宽到 1.2 亿（内部再配合「并行缩放数按总像素动态降级」控峰值）。
+const MERGE_MAX_INPUT_PIXELS = Math.max(1000000, Number(process.env.MERGE_MAX_INPUT_PIXELS || 120000000));
 // 单个单元格最多几张图：一格 20 张就算每张只有 5MB，也是 100MB 同时驻留。
 const MERGE_MAX_IMAGES_PER_CELL = Math.max(1, Math.min(60, Number(process.env.MERGE_MAX_IMAGES_PER_CELL || 20)));
 
@@ -1128,9 +1136,10 @@ async function composeImages(buffers, opts) {
       const px = Math.max(1, m.width || 1) * Math.max(1, m.height || 1);
       if (px > MERGE_MAX_INPUT_PIXELS) {
         const err = new Error(
-          '单张图片分辨率过大（约 ' + (px / 100000000).toFixed(2) + ' 亿像素，上限 ' +
-          (MERGE_MAX_INPUT_PIXELS / 100000000).toFixed(2) + ' 亿）：拼接需要把原图整张解码，' +
-          '这种尺寸会直接把服务器内存撑爆。请先压缩这张图，或改成「一个单元格放一张」。');
+          '这张图是 ' + Math.max(1, m.width || 1) + '×' + Math.max(1, m.height || 1) +
+          '（约 ' + (px / 100000000).toFixed(2) + ' 亿像素），超过单张上限 ' +
+          (MERGE_MAX_INPUT_PIXELS / 100000000).toFixed(1) + ' 亿像素。' +
+          '请先把它压缩到 ' + (MERGE_MAX_INPUT_PIXELS / 100000000).toFixed(1) + ' 亿像素以内再重试。');
         err.code = 'IMAGE_TOO_LARGE';
         throw err;
       }
@@ -1190,8 +1199,9 @@ async function composeImages(buffers, opts) {
             // 不需缩小：原图 buffer 直接当合成输入，不重编码 → 画质零损失
             return { buf: buffers[i], tw, th };
           }
-          // 中间图用 PNG(level 1)：无损、编码极快，只是给画布合成当输入，不产出成品
-          const buf = await S(buffers[i], { failOn: 'none', unlimited: true })
+          // 中间图用 PNG(level 1)：无损、编码极快，只是给画布合成当输入，不产出成品。
+          // sequentialRead: 让 libvips 顺序读，不对原图做随机访问缓存 —— 超大图靠这个把峰值压住。
+          const buf = await S(buffers[i], { failOn: 'none', unlimited: true, sequentialRead: true })
             .resize(tw, th, { fit: 'fill' })
             .png({ compressionLevel: 1 })
             .toBuffer();
@@ -1204,7 +1214,13 @@ async function composeImages(buffers, opts) {
         // 注意：线上是 0.1 核的免费实例，纯 CPU 阶段并行不会有本地这么大的收益，
         // 但至少在升级实例后立刻吃到红利，且不会更慢（最多是等 CPU 排队）。
         prepared = new Array(buffers.length);
-        const PREP_CONC = Math.min(4, buffers.length);
+        // 并行数按「待缩放图片的合计像素」动态降级：
+        // 单张 1 亿像素缩放峰值实测 168MB，4 张一起开就是 670MB，肯定顶爆 512MB 实例。
+        // 所以图很大的时候退回串行 —— 慢一点，但不会被内核杀掉。
+        const srcPx = metas.reduce((a, m) => a + m.w * m.h, 0);
+        let PREP_CONC = Math.min(4, buffers.length);
+        if (srcPx > 250000000) PREP_CONC = 1;
+        else if (srcPx > 120000000) PREP_CONC = 2;
         let next = 0;
         const worker = async () => {
           while (true) {
