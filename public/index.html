@@ -308,6 +308,7 @@
     <div id="jobResults" style="margin-top:10px;"></div>
     <div class="row" style="margin-top:12px;">
       <button class="ghost" id="backFromJobBtn">返回预览</button>
+      <button class="ghost" id="stopJobBtn" style="display:none;color:var(--err);">停止任务</button>
     </div>
   </div>
 
@@ -723,6 +724,30 @@ $('rescanBtn').onclick = () => { hide($('previewCard')); $('scanMsg').textConten
 // 转换做完后允许回到预览，接着做「提取信息」（两件事互不影响，可先后做）
 $('backFromJobBtn').onclick = () => { hide($('jobCard')); show($('previewCard')); };
 
+// 停止任务：以前没有这个能力，用户关掉页面以为停了，服务端其实还在满速下载/拼接/写表。
+let CURRENT_JOB_ID = null;
+$('stopJobBtn').onclick = async () => {
+  const id = CURRENT_JOB_ID;
+  if (!id) return;
+  if (!confirm('停止后不再处理剩下的格子；已经写进表格的图片会保留。确定停止吗？')) return;
+  const btn = $('stopJobBtn');
+  btn.disabled = true;
+  btn.textContent = '正在停止…';
+  try {
+    const r = await apiFetch('/api/job/' + id + '/cancel', { method: 'POST' });
+    const d = await r.json();
+    if (!d.ok) {
+      alert(d.error || '停止失败');
+      btn.disabled = false; btn.textContent = '停止任务';
+      return;
+    }
+    $('jobStat').innerHTML += ' <span style="color:var(--err);">· 已发出停止指令，正在收尾…</span>';
+  } catch (e) {
+    alert('请求失败：' + e.message);
+    btn.disabled = false; btn.textContent = '停止任务';
+  }
+};
+
 // 记住本次提交的单元格，供「只重试失败的那几格」复用，避免为几个失败格把成功格全部重跑
 let LAST_CONVERT = null;
 
@@ -749,6 +774,9 @@ function fmtMs(ms) {
 }
 
 function startPolling(jobId) {
+  CURRENT_JOB_ID = jobId;
+  const sbtn = $('stopJobBtn');
+  sbtn.style.display = 'none'; sbtn.disabled = false; sbtn.textContent = '停止任务';
   show($('jobCard'));
   hide($('previewCard'));
   const bar = $('bar'); const stat = $('jobStat'); const box = $('jobResults');
@@ -785,8 +813,28 @@ function startPolling(jobId) {
       const actTxt = parts.length ? ' &nbsp;·&nbsp; 处理中：' + parts.join(' / ') : '';
       stat.innerHTML = `已完成 <b>${d.done}</b> / ${d.total}${actTxt}` +
         `<span style="color:#8a94a6;"> &nbsp;·&nbsp; 已用 ${fmtMs(d.elapsedMs)}</span>`;
-      if (d.status === 'finished' || d.status === 'error') {
+
+      // 「下载 / 拼接 / 写入」三段耗时，跑的过程中就要能看见。
+      // 原来只在全部结束后、且必须把鼠标悬停到每格的小字上才显示，
+      // 用户在中途完全无从判断到底卡在哪一段 —— 这次排查慢的问题时，我自己也被这一点挡住过。
+      const segs = (x) => {
+        const t = x.timing || {};
+        return `下载 ${fmtMs(t.download || 0)} · 拼接 ${fmtMs(t.compose || 0)} · 写入 ${fmtMs(t.upload || 0)}`;
+      };
+      if (d.status === 'running') {
+        show($('stopJobBtn'));
+        const finishedCells = d.results.filter(x => x.status && x.status !== 'pending');
+        if (finishedCells.length) {
+          const recent = finishedCells.slice(-8);
+          box.innerHTML = `<div class="stat" style="margin-bottom:6px;color:#8a94a6;">已完成的格子 · 最近 ${recent.length} 个（看哪一段最费时）</div>` +
+            recent.map(x => `<div class="stat">${x.range || ''}` +
+              (x.merged ? ` <span class="tag" style="background:#eafaf3;color:var(--ok);">${x.merged}张拼成${x.mergedSize ? ' · ' + x.mergedSize : ''}</span>` : '') +
+              ` <span style="color:#8a94a6;">— ${segs(x)}</span> <b>${fmtMs(x.ms)}</b></div>`).join('');
+        }
+      }
+      if (d.status === 'finished' || d.status === 'error' || d.status === 'cancelled') {
         clearInterval(JOB_TIMER);
+        hide($('stopJobBtn'));
         const okCnt = d.results.filter(x => x.status === 'done').length;
         const failCnt = d.results.filter(x => x.status === 'failed').length;
         const mergedCnt = d.results.filter(x => x.merged).length;
@@ -794,12 +842,16 @@ function startPolling(jobId) {
           const t = x.timing || {};
           return `下载 ${fmtMs(t.download || 0)} / 拼接 ${fmtMs(t.compose || 0)} / 写入 ${fmtMs(t.upload || 0)}`;
         };
+        const skipCnt = d.results.filter(x => x.status === 'skipped').length;
         box.innerHTML = `<div class="stat" style="margin-bottom:6px;">成功 <b class="res-ok">${okCnt}</b> · 失败 <b class="res-fail">${failCnt}</b>` +
+          (skipCnt ? ` · 未处理 <b>${skipCnt}</b>` : '') +
           (mergedCnt ? ` · 其中 <b>${mergedCnt}</b> 个单元格由多图拼成一张` : '') +
           `<span style="color:#8a94a6;"> · 总耗时 ${fmtMs(d.elapsedMs)}</span></div>` +
           d.results.map(x => `<div class="stat">${x.range || x.recordId || ''}${x.merged ? ` <span class="tag" style="background:#eafaf3;color:var(--ok);">${x.mergedSize ? `${x.merged}张拼成 · ${x.mergedSize}` : `${x.merged}个附件`}</span>` : ''} — <span class="${x.status === 'done' ? 'res-ok' : (x.status === 'skipped' ? 'res-ok' : 'res-fail')}">${x.status === 'done' ? '✓ 已写入附件' : (x.status === 'skipped' ? '⊘ ' + (x.error || '跳过') : ('✗ ' + (x.error || '失败')))}</span>` +
-            (x.ms ? ` <span style="color:#8a94a6;" title="${cellTip(x)}">· ${fmtMs(x.ms)}</span>` : '') + `</div>`).join('');
-        stat.innerHTML += d.status === 'finished' ? ' · <b class="res-ok">全部完成</b>' : ' · <b class="res-fail">存在失败</b>';
+            (x.ms ? ` <span style="color:#8a94a6;">· ${segs(x)} = <b>${fmtMs(x.ms)}</b></span>` : '') + `</div>`).join('');
+        stat.innerHTML += d.status === 'finished' ? ' · <b class="res-ok">全部完成</b>'
+          : (d.status === 'cancelled' ? ' · <b class="res-fail">已停止</b>（已写入的图片保留，未处理的格子不受影响）'
+            : ' · <b class="res-fail">存在失败</b>');
 
         // 有失败格时给一条窄路：只重跑这几格。否则用户只能返回预览全部重来，已成功的白跑一遍。
         const failed = d.results.filter(x => x.status === 'failed');

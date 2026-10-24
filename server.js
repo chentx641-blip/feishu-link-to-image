@@ -44,8 +44,8 @@ function getSharp() {
 const ROOT = __dirname;
 const PUBLIC = path.join(ROOT, 'public');
 const PORT = process.env.PORT || 8787;
-const VERSION_TAG = '3.10';
-const BUILD_TAG = '2026-10-23-canvas-fit';
+const VERSION_TAG = '3.11';
+const BUILD_TAG = '2026-10-24-perf-pipeline-1141';
 const BOOT_AT = Date.now();
 // 最后一次收到请求的时间：用来判断实例是「被平台空闲休眠」还是「被内存撑爆杀掉」。
 // Render 免费实例要连续 15 分钟没有任何请求才会休眠，所以只要重启前一刻还有流量，就一定不是休眠。
@@ -793,6 +793,18 @@ function logEvent(obj) {
 }
 const sleep = (ms) => new Promise((r) => setTimeout(r, ms));
 
+// 连接复用：线上实测（2026-10-24）单张图下载 24s/2.5MB，其中每个请求都要重新做一次跨洋 TLS 握手
+// （等待首字节 305ms，而本地复用连接后只要 74ms）。51 张图就白白多花 10 秒以上，格子越碎浪费越多。
+// keepAlive 让同一台 CDN 的连接反复使用，握手只付一次。scheduling:'lifo' 优先用最近用过的连接，
+// 冷连接更容易被 CDN 提前断掉，lifo 能减少「刚取出来就发现已超时」的浪费。
+const HTTPS_AGENT = new https.Agent({
+  keepAlive: true,
+  maxSockets: 32,
+  maxFreeSockets: 16,
+  keepAliveTimeout: 30000,
+  scheduling: 'lifo',
+});
+
 // 用 Node 内置 http/https 直接发请求（不经过 undici 的 fetch URL 序列化），
 // 拿 pathname+search 原文发出，避免预签名 URL 的查询串被改写导致 OSS 报 SignatureDoesNotMatch。
 // 同时：URL 清洗(&amp;->&、去首尾空格)、手动跟随重定向、403/429/5xx 重试退避。
@@ -810,6 +822,7 @@ function rawGet(url, headers, maxRedirects, opts0) {
       path: u.pathname + u.search, // 原文，不重编码
       headers,
     };
+    if (u.protocol === 'https:') opts.agent = HTTPS_AGENT; // 复用跨洋连接，省掉每张图的 TLS 握手
     const req = lib.request(opts, (res) => {
       const code = res.statusCode;
       if ([301, 302, 303, 307, 308].includes(code) && maxRedirects > 0 && res.headers.location) {
@@ -820,7 +833,10 @@ function rawGet(url, headers, maxRedirects, opts0) {
       }
       const chunks = [];
       res.on('data', (c) => chunks.push(c));
-      res.on('end', () => resolve({ status: code, headers: res.headers, buf: Buffer.concat(chunks) }));
+      res.on('end', () => resolve({
+        status: code, headers: res.headers, buf: Buffer.concat(chunks),
+        reused: req.reusedSocket === true, // 复用了池里的旧连接（省掉一次跨洋 TLS 握手）
+      }));
     });
     req.on('error', reject);
     let totalTimer = null;
@@ -882,10 +898,12 @@ async function downloadImage(inputUrl) {
     const headers = headerSets[Math.min(attempt, headerSets.length - 1)];
     const tDl = Date.now();
     try {
-      const { status, headers: rh, buf } = await rawGet(url, headers, 5, { idleMs: 30000, totalMs: 100000 });
+      const { status, headers: rh, buf, reused } = await rawGet(url, headers, 5, { idleMs: 30000, totalMs: 100000 });
       if (status >= 200 && status < 300) {
         if (buf.length < 50) throw new Error('下载内容过小(' + buf.length + 'B)，可能不是图片');
-        logEvent({ ev: 'download', kind: 'ok', ms: Date.now() - tDl, attempt, bytes: buf.length, host });
+        // reused = 这次是否复用了已有 TCP 连接。排查「跨洋握手太贵」时这是唯一的直接证据：
+        // 全是 false 说明连接池没生效（或 CDN 主动断开），true 才说明真省下了 TLS 握手。
+        logEvent({ ev: 'download', kind: 'ok', ms: Date.now() - tDl, attempt, bytes: buf.length, host, reused });
         return buf;
       }
       const body = buf.toString('utf8');
@@ -1064,7 +1082,11 @@ const MERGE_MAX_INPUT_PIXELS = Math.max(1000000, Number(process.env.MERGE_MAX_IN
 // 单个单元格最多几张图：一格 20 张就算每张只有 5MB，也是 100MB 同时驻留。
 const MERGE_MAX_IMAGES_PER_CELL = Math.max(1, Math.min(60, Number(process.env.MERGE_MAX_IMAGES_PER_CELL || 20)));
 
-async function composeImages(buffers) {
+async function composeImages(buffers, opts) {
+  // maxPixels 可由调用方临时下调（内存真的紧张时用它换「不 OOM」）。
+  // 默认仍是 20MP，画质策略与之前一致。
+  const maxPixels = Math.max(1000000, Math.floor(Number(opts && opts.maxPixels) || MERGE_MAX_PIXELS));
+  const onPrep = (opts && typeof opts.onPrep === 'function') ? opts.onPrep : null;
   const PAD = 12; // 网格间距（px）
 
   // 画布布局：给定缩放系数，算出每张图的宽高、行列数和画布总尺寸。
@@ -1124,12 +1146,28 @@ async function composeImages(buffers) {
       return L.gridW * L.gridH;
     };
     const px1 = pxAt(1);
-    if (px1 > MERGE_MAX_PIXELS) {
-      let s = Math.sqrt(MERGE_MAX_PIXELS / px1);
+    // 首轮画布上限：除了「像素预算」，再叠一个「体积经验上限」。
+    //
+    // 为什么需要第二道：PNG 体积对缩放极不敏感。实测同一组 6 张截图，
+    //   画布 18.1MP → 8.55MB，缩到 0.833 倍（12.6MP）→ 仍然 7.70MB。
+    // 也就是说「先按满预算渲染 → 发现超 8MB → 降档重渲」这条路，靠降分辨率几乎压不下来，
+    // 实测会连降两轮、同一个格子渲染 3 次，白烧 7 秒。
+    // 多图拼接的实测密度约 0.53~0.61 MB/MP，按 0.58 估一个「大概率一次就过」的画布，
+    // 反而比反复试探得到的最终尺寸更大（试探会把尺寸越压越小）。
+    // 只对 3 张以上生效：2 张时往往是两张超长截图并排，那类图密度极低（长截图 20MP 才 0.3MB），
+    // 提前压像素纯属白白损失清晰度。
+    const EST_MB_PER_MP = Math.max(0.1, Number(process.env.MERGE_EST_MB_PER_MP || 0.58));
+    let firstPassPx = maxPixels;
+    if (metas.length >= 3) {
+      const estCap = Math.floor(((MERGE_MAX_BYTES / 1048576) * 0.95 / EST_MB_PER_MP) * 1e6);
+      if (estCap < firstPassPx) firstPassPx = Math.max(3000000, estCap);
+    }
+    if (px1 > firstPassPx) {
+      let s = Math.sqrt(firstPassPx / px1);
       for (let i = 0; i < 8; i++) {
         const px = pxAt(s);
-        if (px <= MERGE_MAX_PIXELS) break;
-        s *= Math.sqrt(MERGE_MAX_PIXELS / px) * 0.995;
+        if (px <= firstPassPx) break;
+        s *= Math.sqrt(firstPassPx / px) * 0.995;
       }
       baseScale = Math.max(0.02, Math.min(1, s));
     }
@@ -1143,23 +1181,40 @@ async function composeImages(buffers) {
       if (preparedCache && preparedCache.sc === sc) {
         prepared = preparedCache.items;
       } else {
-        prepared = [];
-        for (let i = 0; i < buffers.length; i++) {
+        const tPrep = Date.now();
+        const one = async (i) => {
           const { w, h } = metas[i];
           const tw = Math.max(1, Math.round(w * sc));
           const th = Math.max(1, Math.round(h * sc));
           if (sc >= 0.999) {
             // 不需缩小：原图 buffer 直接当合成输入，不重编码 → 画质零损失
-            prepared.push({ buf: buffers[i], tw, th });
-          } else {
-            // 中间图用 PNG(level 1)：无损、编码极快，只是给画布合成当输入，不产出成品
-            const buf = await S(buffers[i], { failOn: 'none', unlimited: true })
-              .resize(tw, th, { fit: 'fill' })
-              .png({ compressionLevel: 1 })
-              .toBuffer();
-            prepared.push({ buf, tw, th });
+            return { buf: buffers[i], tw, th };
           }
-        }
+          // 中间图用 PNG(level 1)：无损、编码极快，只是给画布合成当输入，不产出成品
+          const buf = await S(buffers[i], { failOn: 'none', unlimited: true })
+            .resize(tw, th, { fit: 'fill' })
+            .png({ compressionLevel: 1 })
+            .toBuffer();
+          return { buf, tw, th };
+        };
+        // 并行缩放：原来是一张一张 await，10 张图光「缩小」就花 5.5 秒（本地实测）。
+        // 改成同时开工后 1.6 秒，快 3.4 倍。这里限并发 4：
+        //   · 每张中间图都要占内存（解码后再编码），一把全开会让峰值从 132MB 冲到 200MB+；
+        //   · 4 张并行已经能把 I/O 与编码重叠起来，再多收益递减。
+        // 注意：线上是 0.1 核的免费实例，纯 CPU 阶段并行不会有本地这么大的收益，
+        // 但至少在升级实例后立刻吃到红利，且不会更慢（最多是等 CPU 排队）。
+        prepared = new Array(buffers.length);
+        const PREP_CONC = Math.min(4, buffers.length);
+        let next = 0;
+        const worker = async () => {
+          while (true) {
+            const i = next++;
+            if (i >= buffers.length) return;
+            prepared[i] = await one(i);
+          }
+        };
+        await Promise.all(Array.from({ length: PREP_CONC }, () => worker()));
+        if (onPrep) onPrep(Date.now() - tPrep, buffers.length);
         preparedCache = { sc, items: prepared };
       }
       const n = prepared.length;
@@ -1209,9 +1264,14 @@ async function composeImages(buffers) {
     //    用户看到的就是「任务已中断：服务刚重启」。改成降档 PNG，峰值稳定在 160MB 上下，
     //    而且是无损的，清晰度反而比同尺寸 JPEG 更好。
     //    体积近似正比于像素数，故按 sqrt(目标/当前) 推目标缩放系数。
+    //    2026-10-24 修正系数：原来瞄准「刚好等于上限」再乘 0.97，结果每轮都只压下去一点点
+    //    （8.55MB → 0.92 倍 → 仍有 8.2MB），实测 6 图格连降两轮、渲染 3 次共 10 秒。
+    //    改成瞄准上限的 88%（留 12% 余量）后一轮到位，而且最终 scale 比原来更大 ——
+    //    因为旧写法反复试探会把尺寸越压越小，等停下时已经比需要的更小了。
+    const TARGET_BYTES = Math.floor(MERGE_MAX_BYTES * 0.88);
     for (let i = 0; i < 3; i++) {
-      const want = sc * Math.sqrt(MERGE_MAX_BYTES / out.buf.length) * 0.97;
-      sc = Math.max(0.05, Math.min(sc * 0.92, want));
+      const want = sc * Math.sqrt(TARGET_BYTES / out.buf.length);
+      sc = Math.max(0.05, Math.min(sc * 0.95, want));
       out = await render(sc, false);
       if (out.buf.length <= MERGE_MAX_BYTES) {
         console.log(`[compose] n=${buffers.length} scale=${sc.toFixed(3)} ${out.width}x${out.height} ${(out.buf.length / 1048576).toFixed(1)}MB png(降分辨率第${i + 1}轮)`);
@@ -1246,7 +1306,7 @@ async function composeImages(buffers) {
     const prepared = [];
     for (const b of buffers) prepared.push(await decodeImage(b));
     const totalPx = prepared.reduce((a, im) => a + im.width * im.height, 0);
-    const sc = totalPx > MERGE_MAX_PIXELS ? Math.sqrt(MERGE_MAX_PIXELS / totalPx) : 1;
+    const sc = totalPx > maxPixels ? Math.sqrt(maxPixels / totalPx) : 1;
     for (let i = 0; i < prepared.length; i++) {
       const img = prepared[i];
       const tw = Math.max(1, Math.round(img.width * sc));
@@ -1392,24 +1452,36 @@ async function startBitableJob(appToken, tableId, linkField, attachField, overwr
 // 串行等于让带宽和 CPU 互相干等：10 格各 15s 就是 150s。
 // 改成流水线后总时长≈max(下载÷下载并发, 拼接串行总量, 写回串行总量)，实测可压到 1/3 左右。
 // 三段并发度分开设，因为它们争的不是同一种资源：
-//   下载 = 纯带宽，可以放开（默认 4）
-//   拼接 = 纯内存（20MP 画布 RGBA 就是 80MB），Render 免费实例 512MB，必须压到 1
+//   下载 = 带宽 + 跨洋延迟，可以放开（默认 8）
+//   拼接 = 纯内存（20MP 画布 RGBA 就是 80MB）+ 纯 CPU
 //   写回 = 飞书写接口有 QPS 限制，必须串行 + 留间隔（见下方 scheduleUpload）
-const MERGE_DL_CONCURRENCY = Math.max(1, Math.min(8, Number(process.env.MERGE_DL_CONCURRENCY || 4)));
+//
+// 2026-10-24 修正下载并发 4→8：线上实测单张图只有 0.10 MB/s（2.5MB 要 24 秒），
+// 而同一格子 9 张图走 4 路并发能到 0.27 MB/s（2.7 倍）。若瓶颈是 CPU 加密吞吐，
+// 开 4 路应该还是 0.10 才对 —— 实测翻倍说明卡的是单条流的往返延迟（BDP 限制），
+// 多开几条流就能叠加。本地用同一批图复测：并发 4 = 2.48MB/s、8 = 3.20MB/s、12 = 3.03MB/s，
+// 8 是甜点，12 开始退化（CDN 或本机同时打开太多连接）。
+const MERGE_DL_CONCURRENCY = Math.max(1, Math.min(16, Number(process.env.MERGE_DL_CONCURRENCY || 8)));
 const MERGE_COMPOSE_CONCURRENCY = Math.max(1, Math.min(4, Number(process.env.MERGE_COMPOSE_CONCURRENCY || 1)));
 // 写回不按「并发数」控制，而是「串行 + 最小间隔」：实测 3 路并发写会让飞书直接回 too many request。
 const MERGE_UPLOAD_GAP_MS = Math.max(0, Number(process.env.MERGE_UPLOAD_GAP_MS || 250));
 const MERGE_UPLOAD_RETRIES = Math.max(0, Math.min(8, Number(process.env.MERGE_UPLOAD_RETRIES || 4)));
-// 「同时在处理的单元格」上限。不加这个，一次勾 20 格会让 20 张原图同时躺在内存里排队等拼接：
-// 超长截图原图动辄十几 MB，500MB 的免费实例很容易被撑爆 → 进程被杀 → 任务全丢（前端就显示「任务已中断」）。
-// 2026-10-23 从 4 降到 2、再降到 1：实测「竞品任务」表里 10 张图的格子，单格拼接峰值就 440MB，
-// 两格同时在跑必定超过免费实例 512MB。宁可慢一点，也不能用完一次就把实例送进重启。
-const MERGE_CELL_CONCURRENCY = Math.max(1, Math.min(12, Number(process.env.MERGE_CELL_CONCURRENCY || 1)));
-// 内存软上限（MB）：超过就在「开始下一格 / 下载下一张 / 拼接前」等一下，让 GC 把用完的原图回收掉。
-// Node 自己不知道容器只有 512MB，会一路吃到被系统 OOM 杀掉，所以必须自己踩刹车。
-// 2026-10-23 从 330 降到 260：线上仍出现「转换中实例重启」，说明 330 已经太贴近生死线
-// （330 只是 rss 检查点，检查之后的一次解码分配就可能把总量顶过 512）。
-const MERGE_MEM_SOFT_MB = Math.max(128, Number(process.env.MERGE_MEM_SOFT_MB || 260));
+// 「同时在处理的单元格」上限 —— 这里限定的是「在途格数」，不是「同时在跑三段的格数」：
+// 下载允许跨格并发（否则单图格只占 1 条下载流，其余 7 条空转），拼接与写回仍是全局串行。
+// 2026-10-23 曾从 4 一路降到 1，是为了躲开「两格同时拼接把 512MB 撑爆」；
+// 2026-10-24 画布面积算错的问题修好后，单格拼接峰值最低只有 92MB（重格 166~197MB），
+// 再叠加「拼接全局串行」这道真正的闸门，就不需要靠牺牲下载并发来换内存安全了。
+// 于是拆成两件事：在途格数放到 6（让下载池能跑满），拼接并发保持 1（内存唯一真正的守门人）。
+const MERGE_CELL_CONCURRENCY = Math.max(1, Math.min(12, Number(process.env.MERGE_CELL_CONCURRENCY || 6)));
+// 内存护栏。原来的写法是「rss > MERGE_MEM_SOFT_MB(260) 就等一下」，但线上实测实例常驻 RSS 就有 295MB
+// （多任务的结果对象 + V8 不归还的内存页），门槛永远够不着 → 每格都干等满 20 秒再硬着头皮继续。
+// 9 格实测白等了 209 秒，占整批时间的 32%，而这段等待根本没算进单格耗时，界面上完全看不出来。
+// 改成按「距离容器硬上限还剩多少」判断：只有真的快要撞上 512MB 才停，且最多停 6 秒（够 GC 跑一轮）。
+// 真正的兜底不再是等待（等也等不回来），而是「拼接全局串行 + 在途格数上限」。
+const MERGE_MEM_HARD_MB = Math.max(200, Number(process.env.MERGE_MEM_HARD_MB || 512));
+const MERGE_MEM_RESERVE_MB = Math.max(20, Number(process.env.MERGE_MEM_RESERVE_MB || 80));
+const MERGE_MEM_WAIT_MAX_MS = Math.max(0, Number(process.env.MERGE_MEM_WAIT_MAX_MS || 6000));
+const MERGE_MEM_SOFT_MB = Math.max(128, Number(process.env.MERGE_MEM_SOFT_MB || (MERGE_MEM_HARD_MB - MERGE_MEM_RESERVE_MB))); // 预算线：rss+预估需求 超过它才刹车
 
 // 极简信号量：acquire/release 成对使用
 function semaphore(max) {
@@ -1431,22 +1503,49 @@ function semaphore(max) {
 const jobs = new Map();
 let seq = 1;
 
-// 内存刹车：下一格开工前、以及拼接前，如果内存已经逼近容器上限，就先停一下等 GC 回收。
-// 它不能「释放」内存，但能给 V8 回收和上一批请求收尾留时间；真正的兜底是少并发。
-async function waitForMemory(tag, limitMb) {
-  const limit = (limitMb || MERGE_MEM_SOFT_MB) * 1048576;
-  let waited = 0;
-  while (process.memoryUsage().rss > limit && waited < 20000) {
-    if (waited === 0) {
-      logEvent({ ev: 'mem', where: tag, action: 'pause', rssMB: Math.round(process.memoryUsage().rss / 1048576) });
-    }
+// 内存护栏（2026-10-24 重写）。
+//
+// 旧版：`rss > 固定阈值(260) 就等，最多等 20 秒`。线上实测发现它是个纯粹的坑：
+// 实例常驻 RSS 就有 295MB（多任务结果对象 + V8 不归还的内存页），260 这个阈值**永远够不着**，
+// 于是每一格开工前都干等满 20 秒，等完 RSS 也没降（实测等半天一点没动），只能硬着头皮继续。
+// 50 格任务里，9 格实测白等 209 秒 ≈ 整批时间的 32%，而且这段等待发生在单格计时之外，
+// 界面上完全看不到 —— 用户只觉得「怎么这么慢」。
+//
+// 新版：改判「离容器硬上限还剩多少」，而且等待只是礼貌性停一下（最多 6 秒，够 GC 跑一轮）。
+// 真正的兜底不是等，是「拼接全局串行 + 在途格数上限」这两道闸。
+const rssMB = () => Math.round(process.memoryUsage().rss / 1048576);
+
+async function waitForMemory(tag, needMb) {
+  const need = Math.max(0, Number(needMb) || 0);
+  const before = rssMB();
+  if (before + need <= MERGE_MEM_SOFT_MB) return true; // 绝大多数情况在这里直接放行
+  logEvent({ ev: 'mem', where: tag, action: 'pause', rssMB: before, needMB: need, budgetMB: MERGE_MEM_SOFT_MB });
+  const t0 = Date.now();
+  let now = before;
+  while (now + need > MERGE_MEM_SOFT_MB && Date.now() - t0 < MERGE_MEM_WAIT_MAX_MS) {
     if (global.gc) { try { global.gc(); } catch (e) { /* ignore */ } }
-    await sleep(250);
-    waited += 250;
+    await sleep(200);
+    now = rssMB();
   }
-  if (waited > 0) {
-    logEvent({ ev: 'mem', where: tag, action: 'resume', waitedMs: waited, rssMB: Math.round(process.memoryUsage().rss / 1048576) });
-  }
+  const ok = now + need <= MERGE_MEM_SOFT_MB;
+  logEvent({ ev: 'mem', where: tag, action: ok ? 'resume' : 'giveup', waitedMs: Date.now() - t0, rssMB: now });
+  return ok;
+}
+
+// 拼接前的内存闸：返回「这一次允许用的画布像素上限」。
+// 空间够就返回正常预算（画质不动）；万一 RSS 真的顶到门口、等也等不下来，
+// 就按剩余空间把这个格子的画布像素临时压一档 —— 用一点点分辨率换「绝不 OOM」，
+// 比旧版「干等 20 秒然后照样撞上去」务实得多。这种降级会写进日志，便于事后追。
+async function guardComposeMemory(nImgs) {
+  // 实测 9 图拼接时 RSS 增量约 100~130MB，6 图约 80~100MB。取偏保守值。
+  const needMb = Math.min(150, 70 + nImgs * 10);
+  const ok = await waitForMemory('compose', needMb);
+  if (ok) return MERGE_MAX_PIXELS;
+  const now = rssMB();
+  const headroom = Math.max(70, MERGE_MEM_SOFT_MB - now);
+  const cap = Math.max(3000000, Math.min(MERGE_MAX_PIXELS, Math.floor((headroom * 1048576) / 12)));
+  logEvent({ ev: 'mem', where: 'compose', action: 'downgrade', rssMB: now, fromPx: MERGE_MAX_PIXELS, toPx: cap });
+  return cap;
 }
 
 // ---------------------------------------------------------------------------
@@ -1500,6 +1599,15 @@ async function writeImageWithRetry(token, spreadsheetToken, sheetId, range, base
   return { wr: last, attempts: MERGE_UPLOAD_RETRIES + 1, rateLimitedTooLong: true };
 }
 
+// 三段闸门必须是「进程级」而不是「任务级」。
+// 原来三个 semaphore 建在 startJob 内部，于是两个任务并行时各有一份名额
+// （2 个任务 × cell 1 = 2 格同时在拼接），相当于内存上限被乘了任务数 ——
+// 跟「保护 512MB 实例」的初衷正好相反。改成模块级后，不管开几个任务，
+// 全局始终只有 1 个拼接在跑。
+const G_DL_SEM = semaphore(MERGE_DL_CONCURRENCY);
+const G_CP_SEM = semaphore(MERGE_COMPOSE_CONCURRENCY);
+const G_CELL_SEM = semaphore(MERGE_CELL_CONCURRENCY);
+
 function startJob(spreadsheetToken, sheetId, sheetName, cells) {
   const id = String(seq++);
   const job = {
@@ -1510,9 +1618,6 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
     active: { downloading: 0, composing: 0, uploading: 0 },
   };
   jobs.set(id, job);
-  const dlSem = semaphore(MERGE_DL_CONCURRENCY);
-  const cpSem = semaphore(MERGE_COMPOSE_CONCURRENCY);
-  const cellSem = semaphore(MERGE_CELL_CONCURRENCY);
 
   (async () => {
     let token;
@@ -1527,14 +1632,26 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
     logEvent({ ev: 'job', jobId: id, kind: 'start', cells: cells.length, sheet: sheetName });
 
     const runCell = async (c, idx) => {
-      await cellSem.acquire(); // 限制同时在途的格数，防止大量原图同时占内存
-      await waitForMemory('cell'); // 内存已逼近上限就先等一下，别把实例撑爆
+      // 只限「在途格数」，不再在这里等内存。
+      // 旧版这里还有一句 waitForMemory('cell')，是本次排查出来的头号时间黑洞：
+      // 阈值 260MB 低于实例常驻的 295MB，等于每格开工前必等满 20 秒，9 格白等 209 秒。
+      // 内存安全改由「拼接全局串行」守门，不靠开工前空等。
+      await G_CELL_SEM.acquire();
       const tAll = Date.now();
       const timing = {};
       const r = { range: c.range, source: c.source, status: 'pending', imageCount: c.imageCount || 1, stage: 'queued' };
       job.results[idx] = r;
       let nImgs = 1; // 必须在 try 外声明：finally 里的日志要用到它
+      // 停止任务用：每个阶段开始前问一句「还要继续吗」。
+      // 放在阶段之间而不是中途打断，是为了不留下半张图/半个请求 —— 宁可多跑完手上这一小段。
+      const bailIfCancelled = () => {
+        if (!job.cancelled) return;
+        const e = new Error('任务已手动停止');
+        e.code = 'CANCELLED';
+        throw e;
+      };
       try {
+        bailIfCancelled();
         const urls = (Array.isArray(c.urls) && c.urls.length > 0) ? c.urls : (c.url ? [c.url] : []);
         if (urls.length === 0) throw new Error('该单元格没有可用链接');
         if (urls.length > MERGE_MAX_IMAGES_PER_CELL) {
@@ -1542,20 +1659,24 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
             ' 张）。全部同时驻留内存会把服务器压垮，请把它拆到多个单元格，或分批转换。');
         }
 
-        // ---- 段1：下载（同格多图并发，每张占一个带宽名额）----
+        // ---- 段1：下载（跨格共享全局下载池，让带宽始终跑满）----
+        // 关键：名额来自进程级 G_DL_SEM，不是每个格自己的池子。
+        // 单图格也能和别的格子同时下载 —— 旧版受 cell 串行限制，单图格只占 1 条流，
+        // 而实测单流只有 0.10~0.11 MB/s（2.5MB 要 24 秒），是整批任务最慢的一段。
         r.stage = 'downloading';
         job.active.downloading++;
         const tDl = Date.now();
         let bufs;
         try {
           bufs = await Promise.all(urls.map(async (u) => {
-            await dlSem.acquire();
+            await G_DL_SEM.acquire();
             try {
               const b = await downloadImage(u);
-              // 每张下载完就看一眼内存：多张超大图同时驻留，是最容易把实例顶爆的时刻
-              if (process.memoryUsage().rss > MERGE_MEM_SOFT_MB * 1048576) await waitForMemory('download');
+              // 每张下载完看一眼内存：多张超大图同时驻留是最容易顶爆的时刻。
+              // need=0 表示「不预留额外空间，只看当前是否已经贴到上限」，正常情况是立即返回。
+              await waitForMemory('download', 0);
               return b;
-            } finally { dlSem.release(); }
+            } finally { G_DL_SEM.release(); }
           }));
         } finally {
           job.active.downloading--;
@@ -1563,20 +1684,23 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
         }
         // 记下这格一共拉了多少字节：排查内存问题时，这是「这一格有多重」的直接指标
         r.srcBytes = bufs.reduce((a, b) => a + b.length, 0);
+        bailIfCancelled(); // 图都拉完了但还没写表：此刻停掉最划算，表格完全不受影响
 
-        // ---- 段2：拼接（仅一格多图；独占内存，串行）----
+        // ---- 段2：拼接（仅一格多图；全局串行，是内存唯一真正的守门人）----
         let buf, ext;
         if (bufs.length > 1) {
           r.stage = 'composing';
           job.active.composing++;
           const tCp = Date.now();
           try {
-            // 拼接是整条链路里最吃内存的一步（一张原图解码 + 一整张画布），
-            // 所以门槛要比平时更低，给解码和画布预留出空间，否则「检查通过」之后照样会顶爆。
-            await waitForMemory('compose', Math.max(120, MERGE_MEM_SOFT_MB - 90));
-            await cpSem.acquire();
+            // 先按「这格有多重」要一个画布像素上限：空间够就照常用满 20MP（画质不动），
+            // 万一 RSS 已经顶到门口，就临时压一档换「绝不 OOM」，而不是干等。
+            const capPx = await guardComposeMemory(bufs.length);
+            await G_CP_SEM.acquire();
             let merged;
-            try { merged = await composeImages(bufs); } finally { cpSem.release(); }
+            try {
+              merged = await composeImages(bufs, { maxPixels: capPx, onPrep: (ms, n) => { timing.prep = ms; } });
+            } finally { G_CP_SEM.release(); }
             buf = merged.buf; ext = merged.ext;
             r.mergedSize = merged.width + 'x' + merged.height;
             r.mergedScale = Number(merged.scale.toFixed(3));
@@ -1592,6 +1716,7 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
         }
 
         // ---- 段3：写回（串行 + 最小间隔 + 限流退避重试）----
+        bailIfCancelled(); // 写回是唯一会改动表格的动作，进这里之前再确认一次
         r.stage = 'uploading';
         job.active.uploading++;
         const tUp = Date.now();
@@ -1622,10 +1747,17 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
             : '写入图片失败：' + ((wr && wr.msg) || JSON.stringify(wr || {}).slice(0, 200));
         }
       } catch (e) {
-        r.status = 'failed';
-        r.error = String((e && e.message) || e).slice(0, 300);
+        if (e && e.code === 'CANCELLED') {
+          // 被用户停止：这一格什么都没写进表格，标成 skipped 而不是 failed，
+          // 免得用户以为「跑失败了要重试」——它只是没开始而已。
+          r.status = 'skipped';
+          r.error = '任务已停止，这一格未处理';
+        } else {
+          r.status = 'failed';
+          r.error = String((e && e.message) || e).slice(0, 300);
+        }
       } finally {
-        r.stage = r.status === 'failed' ? 'failed' : 'done';
+        r.stage = r.status === 'failed' ? 'failed' : (r.status === 'skipped' ? 'skipped' : 'done');
         r.ms = Date.now() - tAll;
         r.timing = timing;
         if (r.status === 'failed') job.failCount++;
@@ -1638,13 +1770,13 @@ function startJob(spreadsheetToken, sheetId, sheetName, cells) {
           srcBytes: r.srcBytes || null, images: nImgs, rssMB: Math.round(process.memoryUsage().rss / 1048576),
           err: r.status === 'failed' ? String(r.error || '').slice(0, 160) : undefined,
         });
-        cellSem.release();
+        G_CELL_SEM.release();
       }
     };
 
     try {
       await Promise.all(cells.map((c, i) => runCell(c, i)));
-      job.status = 'finished';
+      job.status = job.cancelled ? 'cancelled' : 'finished';
     } catch (e) {
       job.status = 'error';
       job.error = String((e && e.message) || e);
@@ -1998,7 +2130,8 @@ const server = http.createServer(async (req, res) => {
         mergePolicy: {
           maxPixels: MERGE_MAX_PIXELS, maxBytes: MERGE_MAX_BYTES, pngLevel: 6,
           maxInputPixels: MERGE_MAX_INPUT_PIXELS, maxImagesPerCell: MERGE_MAX_IMAGES_PER_CELL,
-          memSoftMB: MERGE_MEM_SOFT_MB,
+          memSoftMB: MERGE_MEM_SOFT_MB, memHardMB: MERGE_MEM_HARD_MB, memReserveMB: MERGE_MEM_RESERVE_MB,
+          memWaitMaxMs: MERGE_MEM_WAIT_MAX_MS,
           concurrency: {
             cell: MERGE_CELL_CONCURRENCY, download: MERGE_DL_CONCURRENCY, compose: MERGE_COMPOSE_CONCURRENCY,
             upload: 'serial', uploadGapMs: MERGE_UPLOAD_GAP_MS, uploadRetries: MERGE_UPLOAD_RETRIES,
@@ -2027,10 +2160,12 @@ const server = http.createServer(async (req, res) => {
         heapUsedMB: Math.round(mu.heapUsed / 1048576),
         peakRssMB: PEAK_RSS_MB,
         memSoftLimitMB: MERGE_MEM_SOFT_MB,
+        memHardLimitMB: MERGE_MEM_HARD_MB,
+        memReserveMB: MERGE_MEM_RESERVE_MB,
         jobs: { total: jobs.size, running },
         lastCrash: LAST_CRASH,
         lastStop: LAST_STOP,
-        concurrency: { cell: MERGE_CELL_CONCURRENCY, download: MERGE_DL_CONCURRENCY, compose: MERGE_COMPOSE_CONCURRENCY },
+        concurrency: { inFlightCells: MERGE_CELL_CONCURRENCY, download: MERGE_DL_CONCURRENCY, compose: MERGE_COMPOSE_CONCURRENCY },
       });
     }
 
@@ -2291,8 +2426,24 @@ const server = http.createServer(async (req, res) => {
         results: job.results.filter(Boolean), error: job.error || null,
         elapsedMs: Date.now() - job.startedAt,
         failCount: job.failCount || 0,
+        cancelled: !!job.cancelled,
         active: job.active,
       });
+    }
+
+    // 停止任务：2026-10-24 之前根本没有这个能力 —— 用户以为关掉页面就停了，
+    // 实际上服务端仍在满速下载、拼接、往表里写（实测有人关了页面，后台又跑了十几分钟）。
+    // 现在改成打标记，各阶段在关键点自行退出；已经写进表格的图片不回滚（那是用户的成果）。
+    if (req.method === 'POST' && urlp.startsWith('/api/job/') && urlp.endsWith('/cancel')) {
+      if (!gateOK(req, res, null)) return;
+      const id = urlp.slice('/api/job/'.length, -'/cancel'.length);
+      const job = jobs.get(id);
+      if (!job) return sendJSON(res, 404, { ok: false, code: 'JOB_LOST', error: '任务不存在（服务可能已重启）' });
+      if (job.status !== 'running') return sendJSON(res, 200, { ok: true, status: job.status, alreadyDone: true });
+      job.cancelled = true;
+      job.heartbeat = Date.now();
+      logEvent({ ev: 'job', jobId: id, kind: 'cancel', done: job.done, total: job.total });
+      return sendJSON(res, 200, { ok: true, status: 'cancelling', message: '已停止：不再开始新的格子，正在处理的那一格会跑完再停' });
     }
 
     // 诊断日志（管理员）：最近若干条下载/拼接/写入事件，含各段耗时。
